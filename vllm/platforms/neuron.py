@@ -1,8 +1,11 @@
 from typing import TYPE_CHECKING, Optional
 
-from vllm.logger import init_logger
+import torch
 
-from .interface import Platform, PlatformEnum
+from vllm.logger import init_logger
+from .interface import _Backend, Platform, PlatformEnum
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -27,6 +30,21 @@ class NeuronPlatform(Platform):
     @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
         return False
+
+    @classmethod
+    def get_default_attn_backend(cls, selected_backend: _Backend) -> _Backend:
+        if selected_backend != _Backend.NEURON:
+            logger.info("Cannot use %s backend on Neuron.", selected_backend)
+        return _Backend.NEURON
+
+    @classmethod
+    def get_attn_backend_cls(cls, selected_backend: _Backend, head_size: int,
+                             dtype: torch.dtype, kv_cache_dtype: Optional[str],
+                             block_size: int, use_v1: bool) -> str:
+        if not use_v1:
+            logger.info("Neuron backend is only supported in V1")
+        logger.info("Using Pallas backend.")
+        return "vllm.v1.attention.backends.neuron_attn.NeuronAttentionBackend"
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

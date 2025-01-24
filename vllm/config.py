@@ -22,7 +22,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (QUANTIZATION_METHODS,
                                                      get_quantization_config)
 from vllm.model_executor.models import ModelRegistry
-from vllm.platforms import CpuArchEnum
+from vllm.platforms import CpuArchEnum, current_platform
 from vllm.tracing import is_otel_available, otel_import_error_traceback
 from vllm.transformers_utils.config import (
     ConfigFormat, get_config, get_hf_image_processor_config,
@@ -3174,7 +3174,17 @@ class VllmConfig:
 
         if self.compilation_config is None:
             self.compilation_config = CompilationConfig()
-        if envs.VLLM_USE_V1 and self.model_config is not None and \
+
+        
+        if envs.VLLM_USE_V1 and not self.model_config.enforce_eager and current_platform.is_neuron():
+            self.compilation_config.custom_ops = ["silu_and_mul"]
+            self.compilation_config.use_cudagraph = True
+            self.compilation_config.use_inductor = True
+            self.compilation_config.cudagraph_num_of_warmups = 1
+            self.compilation_config.pass_config.enable_fusion = False
+            self.compilation_config.pass_config.enable_reshape = False
+            self.compilation_config.level = CompilationLevel.DYNAMO_AS_IS
+        elif envs.VLLM_USE_V1 and self.model_config is not None and \
             not self.model_config.enforce_eager:
             # NOTE(woosuk): Currently, we use inductor because the piecewise
             # CUDA graphs do not work properly with the custom CUDA kernels.
@@ -3265,7 +3275,10 @@ class VllmConfig:
                 ]
         else:
             batch_size_capture_list = []
-            if self.model_config is not None and \
+            if current_platform.is_neuron():
+                # TODO(gnovack) - choose a proper list of batch sizes
+                batch_size_capture_list = [128]
+            elif self.model_config is not None and \
                 not self.model_config.enforce_eager:
                 batch_size_capture_list = [1, 2, 4
                                            ] + [i for i in range(8, 513, 8)]
