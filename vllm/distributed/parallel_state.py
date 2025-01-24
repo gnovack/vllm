@@ -34,6 +34,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
+from torch_xla.core import xla_model as xm
 
 import vllm.distributed.kv_transfer.kv_transfer_agent as kv_transfer
 import vllm.envs as envs
@@ -351,9 +352,10 @@ class GroupCoordinator:
                 not self.xpu_communicator.disabled:
             return self.xpu_communicator.all_reduce(input_)
         
+        # TODO(gnovack) - remove check for is_xla_tensor once sampling is done on-device 
         if self.neuron_communicator is not None and \
-                not self.neuron_communicator.disabled:
-            return self.neuron_communicator.all_reduce(input_)
+                not self.neuron_communicator.disabled and xm.is_xla_tensor(input_):
+                return self.neuron_communicator.all_reduce(input_)
 
         return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
 
@@ -392,9 +394,14 @@ class GroupCoordinator:
             return tpu_comm.all_gather(input_, dim)
         
         # For Neuron, use Neuron communicator.
+        group = self.device_group
         neuron_comm = self.neuron_communicator
         if neuron_comm is not None and not neuron_comm.disabled:
-            return neuron_comm.all_gather(input_, dim)
+            # TODO(gnovack) - remove check for is_xla_tensor once sampling is done on-device
+            if xm.is_xla_tensor(input_):
+                return neuron_comm.all_gather(input_, dim)
+            else:
+                group = self.cpu_group
 
         # For HPUs, use HPU communicator.
         hpu_comm = self.hpu_communicator
@@ -410,20 +417,22 @@ class GroupCoordinator:
         # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
         output_size = (input_size[0] * world_size, ) + input_size[1:]
         # Allocate output tensor.
-        output_tensor = torch.empty(output_size,
-                                    dtype=input_.dtype,
-                                    device=input_.device)
-        # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor,
-                                                 input_,
-                                                 group=self.device_group)
+        with torch.inference_mode(False):
+            output_tensor = torch.empty(output_size,
+                                        dtype=input_.dtype,
+                                        device=input_.device,
+                                        requires_grad=False)
+            # All-gather.
+            torch.distributed.all_gather_into_tensor(output_tensor,
+                                                    input_,
+                                                    group=group)
         # Reshape
         output_tensor = output_tensor.reshape((world_size, ) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(input_size[:dim] +
-                                              (world_size *
-                                               input_size[dim], ) +
-                                              input_size[dim + 1:])
+                                            (world_size *
+                                            input_size[dim], ) +
+                                            input_size[dim + 1:])
         return output_tensor
 
     def gather(self,
@@ -980,6 +989,9 @@ def init_distributed_environment(
             init_method=distributed_init_method,
             world_size=world_size,
             rank=rank)
+        
+        # TODO(gnovack) - XLA CC Ops use an unamed process group, so we need to register a group with no name here 
+        torch._C._distributed_c10d._register_process_group("", torch.distributed.group.WORLD)
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816

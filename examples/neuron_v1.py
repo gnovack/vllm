@@ -18,10 +18,10 @@ sampling_params = SamplingParams(temperature=0.8, top_p=1)
 llm = LLM(
     model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     max_num_seqs=8,
-    max_model_len=128,
+    max_model_len=512,
     block_size=128,
     device="neuron",
-    tensor_parallel_size=1,
+    tensor_parallel_size=4,
     disable_async_output_proc=True,
     enable_chunked_prefill=True,
     worker_cls="vllm.v1.worker.neuron_worker.NeuronWorker"

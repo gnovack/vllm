@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 import torch.distributed
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
+from torch_xla._internal.pjrt import initialize_multiprocess
 
 from vllm.config import ParallelConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
@@ -30,9 +32,6 @@ class NeuronWorker(Worker):
 
     def initialize(self):
         if self.device_config.device.type == "cpu":
-            
-            # TODO(gnovack) - support logical nc configs here too
-            # os.environ["NEURON_RT_NUM_CORES"] = "1"
             
             # Initialize the distributed environment.
             init_worker_distributed_environment(self.parallel_config, self.rank,
@@ -74,8 +73,10 @@ def init_worker_distributed_environment(
     """Initialize the distributed environment."""
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
+    initialize_multiprocess(rank, parallel_config.tensor_parallel_size)
+
     init_distributed_environment(parallel_config.world_size, rank,
-                                 distributed_init_method, local_rank, backend="gloo")
+                                 distributed_init_method, local_rank, backend="xla")
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size, backend="gloo")
+                                      parallel_config.pipeline_parallel_size)

@@ -372,7 +372,7 @@ class NeuronModelRunner:
                     active_mask,
                     (
                         0,
-                        B_P_SIZE - active_mask.shape[1],
+                        padded_num_tokens - active_mask.shape[1],
                         0,
                         B_P_SIZE - active_mask.shape[0],
                     ),
@@ -631,7 +631,7 @@ class NeuronModelRunner:
             attn_mask,
             (
                 0,
-                LARGE_TILE_SZ + B_P_SIZE - attn_mask.shape[1],
+                LARGE_TILE_SZ + num_tokens - attn_mask.shape[1],
                 0,
                 B_P_SIZE - attn_mask.shape[0],
             ),
