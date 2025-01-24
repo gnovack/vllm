@@ -8,7 +8,7 @@ prompts = [
     "The future of AI is",
 ]
 # Create a sampling params object.
-sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+sampling_params = SamplingParams(temperature=0.8, top_p=1)
 
 # Create an LLM.
 llm = LLM(
@@ -25,7 +25,10 @@ llm = LLM(
     # The device argument can be either unspecified for automated detection,
     # or explicitly assigned.
     device="neuron",
-    tensor_parallel_size=2)
+    tensor_parallel_size=1,
+    disable_async_output_proc=True,
+    enable_chunked_prefill=True
+)
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)

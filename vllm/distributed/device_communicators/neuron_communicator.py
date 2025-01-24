@@ -1,11 +1,7 @@
-import os
 
 import torch
-import torch.distributed as dist
 from torch.distributed import ProcessGroup
-
 from vllm.platforms import current_platform
-import neuronx_distributed
 
 if current_platform.is_neuron():
     import torch_xla.core.xla_model as xm

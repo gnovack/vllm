@@ -234,20 +234,7 @@ def _flash_attention_core(
                        buffer=nl.psum)
 
 
-    # for k_i in nl.sequential_range(LARGE_TILE_SZ // B_P_SIZE):
     for k_i in nl.affine_range(LARGE_TILE_SZ // B_P_SIZE):
-        # print(f"K_I: {k_i.e}")
-
-        # assert p_local_transposed.shape == (128, LARGE_TILE_SZ), f"P Local Shape: {p_local_transposed.shape}; k_i: {k_i.e}, {k_i.tile}"
-        # print(f"P Local Shape: {p_local_transposed.shape}; k_i: {k_i.e}, {k_i.tile}")
-        
-        # p_local_slice = p_local_transposed[:, nl.ds(k_i * B_P_SIZE, B_P_SIZE)]
-        # assert p_local_slice.shape == (128, 128), f"P Local Slice Shape: {p_local_slice.shape}; P local type: {p_local_slice.dtype}"
-        # print(f"P Local Slice Shape: {p_local_slice.shape}; P local type: {p_local_slice.dtype}")
-        # assert v[k_i, :, :].shape == (128, 128), f"V Shape: {v.shape}; V type: {v.dtype}"
-        # print(f"V Shape: {v.shape}; V type: {v.dtype}")
-        # assert pv_psum.shape == (128, 128), f"PV Sum Shape: {v.shape}"
-        # print(f"PV Sum Shape: {pv_psum.shape}")
 
         pv_psum[:, :] += nl.matmul(
             p_local_transposed[:, nl.ds(k_i * B_P_SIZE, B_P_SIZE)],
@@ -367,9 +354,9 @@ def flash_paged_attention(
     """
     config = config or FlashConfig()
     B_F_SIZE = 512
-    # B_P_SIZE = 128
-    B_P_SIZE = 128
     b, h, d, seqlen_q = query.shape
+    B_P_SIZE = 128
+    # B_P_SIZE = min(seqlen_q, 128)
     B_D_SIZE = d
     LARGE_TILE_SZ = config.seq_tile_size
 

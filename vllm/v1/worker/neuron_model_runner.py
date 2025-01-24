@@ -331,13 +331,13 @@ class NeuronModelRunner:
         num_active_blocks_shifted = shift_bit_length(
             ((context_lens+ self.block_size - 1) // self.block_size).sum().item()
         )
-        num_active_blocks_factor = (LARGE_TILE_SZ // self.block_size // num_active_blocks_shifted)
+        num_active_blocks_factor = max(LARGE_TILE_SZ // self.block_size // num_active_blocks_shifted, 1)
         num_active_blocks = num_active_blocks_shifted * num_active_blocks_factor
 
-        assert (num_active_blocks * self.block_size) == LARGE_TILE_SZ, "invalid {num_active_blocks=}"
+        # assert (num_active_blocks * self.block_size) == LARGE_TILE_SZ, "invalid {num_active_blocks=}"
 
         context_kv_len = num_active_blocks * self.block_size
-        assert context_kv_len == LARGE_TILE_SZ, f"invalid {context_kv_len=}"
+        # assert context_kv_len == LARGE_TILE_SZ, f"invalid {context_kv_len=}"
 
 
         block_table = self.input_batch.block_table[:num_reqs]
@@ -361,9 +361,10 @@ class NeuronModelRunner:
                     prior_mask,
                     (
                         0,
-                        LARGE_TILE_SZ - prior_mask.shape[1],
+                        max(context_kv_len, LARGE_TILE_SZ) - prior_mask.shape[1],
                         0,
-                        B_P_SIZE - prior_mask.shape[0],
+                        # B_P_SIZE - prior_mask.shape[0],
+                        padded_num_tokens - prior_mask.shape[0],
                     ),
                     "constant",
                     0,
@@ -374,7 +375,8 @@ class NeuronModelRunner:
                         0,
                         padded_num_tokens - active_mask.shape[1],
                         0,
-                        B_P_SIZE - active_mask.shape[0],
+                        # B_P_SIZE - active_mask.shape[0],
+                        padded_num_tokens - active_mask.shape[0],
                     ),
                     "constant",
                     0,

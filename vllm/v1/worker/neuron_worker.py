@@ -56,7 +56,7 @@ class NeuronWorker(Worker):
 
     def compile_or_warm_up_model(self):
         # TODO: Implement AOT compilation logic here...
-        self.model_runner.capture_model()
+        # self.model_runner.capture_model()
         ...
     
     def initialize_cache(self, num_device_blocks: int) -> None:
