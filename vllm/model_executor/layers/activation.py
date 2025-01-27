@@ -91,7 +91,6 @@ class SiluAndMul(CustomOp):
     def forward_neuron(self, x: torch.Tensor) -> torch.Tensor:
         # TODO(gnovack) - clean this up
         d = x.shape[-1] // 2
-        # s = F.silu(x[:, :, :d]) 
         if len(x.shape) == 3:
             s = x[:, :, :d] * torch.nn.functional.sigmoid(x[:, :, :d])
             return s * x[:, :, d:]

@@ -356,7 +356,6 @@ def flash_paged_attention(
     B_F_SIZE = 512
     b, h, d, seqlen_q = query.shape
     B_P_SIZE = 128
-    # B_P_SIZE = min(seqlen_q, 128)
     B_D_SIZE = d
     LARGE_TILE_SZ = config.seq_tile_size
 
@@ -379,7 +378,6 @@ def flash_paged_attention(
     assert tuple(value_cache.shape) == (
         # TODO(gnovack) - hacky padding block
         num_blocks + 1,
-        # num_blocks,
         block_size,
         k_h,
         d,

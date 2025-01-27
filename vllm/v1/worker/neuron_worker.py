@@ -14,6 +14,7 @@ from vllm.distributed import (ensure_model_parallel_initialized,
                               set_custom_all_reduce)
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.neuron_model_runner import NeuronModelRunner
 
@@ -26,11 +27,10 @@ if TYPE_CHECKING:
 class NeuronWorker(Worker):
 
     @torch.inference_mode()
-    def determine_num_available_blocks(self) -> Tuple[int, int]:
-        # TODO(gnovack) - get number of blocks based on available mem
-        return (1_000, 0)
+    def determine_available_memory(self) -> int:
+        return 6e9
 
-    def initialize(self):
+    def init_device(self):
         if self.device_config.device.type == "cpu":
             
             # Initialize the distributed environment.
@@ -50,18 +50,13 @@ class NeuronWorker(Worker):
         with torch.inference_mode():
             self.model_runner = NeuronModelRunner(self.vllm_config, self.device)
 
-        # TODO(gnovack) - get number of blocks based on available mem
-        self.cache_config.num_gpu_blocks = 1_000
-        self.cache_config.num_cpu_blocks = 0
-
     def compile_or_warm_up_model(self):
         # TODO: Implement AOT compilation logic here...
-        # self.model_runner.capture_model()
-        ...
+        self.model_runner.capture_model()
     
-    def initialize_cache(self, num_device_blocks: int) -> None:
+    def initialize_cache(self, kv_cache_config: KVCacheConfig) -> None:
         # TODO(gnovack) - validate num_device_blocks
-        self.model_runner.initialize_kv_cache(num_device_blocks)
+        self.model_runner.initialize_kv_cache(kv_cache_config)
 
 
 def init_worker_distributed_environment(

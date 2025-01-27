@@ -44,6 +44,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
@@ -195,19 +196,14 @@ class LlamaAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-       
+        qkv, _ = self.qkv_proj(hidden_states)
+        
+        # TODO(gnovack) - Figure out a better way to streamline QKV splitting
         if current_platform.is_neuron():
-            # TODO(gnovack) - Figure out a better way to streamline QKV computation
-            w_q = self.qkv_proj.weight.t()[:, :self.q_size]
-            q =  torch.einsum('bsh,hq->bsq', hidden_states, w_q)
-            
-            w_k = self.qkv_proj.weight.t()[:, self.q_size:self.q_size+self.kv_size]
-            k =  torch.einsum('bsh,hk->bsk', hidden_states, w_k)
-            
-            w_v = self.qkv_proj.weight.t()[:, self.q_size+self.kv_size:self.q_size + (2*self.kv_size)]
-            v =  torch.einsum('bsh,hk->bsk', hidden_states, w_v)
+            q = qkv[:, :, :self.q_size]
+            k = qkv[:, :, self.q_size:self.q_size+self.kv_size]
+            v = qkv[:, :, self.q_size+self.kv_size:self.q_size + (2*self.kv_size)]
         else:
-            qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q, k = self.rotary_emb(positions, q, k)

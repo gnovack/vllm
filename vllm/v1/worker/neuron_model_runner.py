@@ -7,6 +7,8 @@ import torch
 import torch.distributed
 import torch.nn as nn
 
+from vllm.attention.backends.abstract import AttentionType
+from vllm.attention.layer import Attention
 from vllm.config import CompilationLevel, VllmConfig
 from vllm.distributed.parallel_state import graph_capture
 from vllm.forward_context import set_forward_context
@@ -20,7 +22,10 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
 from vllm.v1.attention.backends.neuron_attn import NeuronAttentionBackend, NeuronAttentionMetadata
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+                                        KVCacheSpec)
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -96,6 +101,7 @@ class NeuronModelRunner:
             max_num_blocks_per_req=self.max_num_blocks_per_req,
             device="cpu",
             pin_memory=self.pin_memory,
+            vocab_size=model_config.get_vocab_size(),
         )
 
         self.input_ids = torch.zeros(self.max_num_tokens,
@@ -109,7 +115,8 @@ class NeuronModelRunner:
             dtype=self.dtype,
             device="cpu")
 
-        self.neuron_compilation_batch_sizes = list(reversed(self.vllm_config.compilation_config.capture_sizes))
+        # TODO(gnovack) - use compile sizes...
+        self.neuron_compilation_batch_sizes = list(reversed(self.vllm_config.compilation_config.cudagraph_capture_sizes))
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
@@ -155,8 +162,8 @@ class NeuronModelRunner:
             start_index = len(req_state.block_ids)
             end_index = start_index + num_new_blocks
             req_state.block_ids.extend(req_data.new_block_ids)
-            self.input_batch.block_table_cpu[
-                req_index, start_index:end_index] = req_data.new_block_ids
+            self.input_batch.block_table.append_row(req_index, start_index,
+                                                    req_data.new_block_ids)
 
         req_ids_to_add: List[str] = []
         # Add new requests to the cached states.
@@ -215,11 +222,7 @@ class NeuronModelRunner:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        # OPTIMIZATION: Start copying the block table first.
-        # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table[:num_reqs].copy_(
-            self.input_batch.block_table_cpu_tensor[:num_reqs],
-            non_blocking=True)
+        self.input_batch.block_table.commit(num_reqs)
 
         # Get the number of scheduled tokens for each request.
         # TODO: The Python loop can be slow. Optimize.
@@ -278,7 +281,7 @@ class NeuronModelRunner:
         # where K is the max_num_blocks_per_req and the block size is 2.
         # NOTE(woosuk): We can't simply use `token_indices // block_size` here
         # because M (max_model_len) is not necessarily divisible by block_size.
-        block_numbers = self.input_batch.block_table_cpu_tensor.flatten()[
+        block_numbers = self.input_batch.block_table.get_cpu_tensor().flatten()[
             req_indices * self.max_num_blocks_per_req +
             positions_np // self.block_size]
         block_offsets = torch.from_numpy(positions_np % self.block_size)
@@ -333,14 +336,12 @@ class NeuronModelRunner:
         )
         num_active_blocks_factor = max(LARGE_TILE_SZ // self.block_size // num_active_blocks_shifted, 1)
         num_active_blocks = num_active_blocks_shifted * num_active_blocks_factor
-
-        # assert (num_active_blocks * self.block_size) == LARGE_TILE_SZ, "invalid {num_active_blocks=}"
+        assert (num_active_blocks * self.block_size) % LARGE_TILE_SZ == 0, "invalid {num_active_blocks=}"
 
         context_kv_len = num_active_blocks * self.block_size
-        # assert context_kv_len == LARGE_TILE_SZ, f"invalid {context_kv_len=}"
 
 
-        block_table = self.input_batch.block_table[:num_reqs]
+        block_table = self.input_batch.block_table.get_cpu_tensor()[:num_reqs]
         active_block_table = get_active_block_tables(
             block_table,
             torch.tensor(query_lens),
@@ -363,8 +364,7 @@ class NeuronModelRunner:
                         0,
                         max(context_kv_len, LARGE_TILE_SZ) - prior_mask.shape[1],
                         0,
-                        # B_P_SIZE - prior_mask.shape[0],
-                        padded_num_tokens - prior_mask.shape[0],
+                        B_P_SIZE - prior_mask.shape[0],
                     ),
                     "constant",
                     0,
@@ -375,8 +375,7 @@ class NeuronModelRunner:
                         0,
                         padded_num_tokens - active_mask.shape[1],
                         0,
-                        # B_P_SIZE - active_mask.shape[0],
-                        padded_num_tokens - active_mask.shape[0],
+                        B_P_SIZE - active_mask.shape[0],
                     ),
                     "constant",
                     0,
@@ -397,7 +396,7 @@ class NeuronModelRunner:
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_start_loc=seq_start_loc,
-            block_table=self.input_batch.block_table[:num_reqs],
+            block_table=self.input_batch.block_table.get_device_tensor()[:num_reqs],
             slot_mapping=slot_mapping,
             num_active_blocks=num_active_blocks,
             active_block_table=active_block_table,
@@ -422,7 +421,11 @@ class NeuronModelRunner:
                 or scheduler_output.scheduled_resumed_reqs):
             skip_copy = False
         # Create the sampling metadata.
-        sampling_metadata = self.input_batch.make_sampling_metadata(skip_copy)
+        req_id_output_token_ids: Dict[str, List[int]] = \
+            {req_id: req.output_token_ids \
+                for req_id, req in self.requests.items()}
+        
+        sampling_metadata = self.input_batch.make_sampling_metadata(req_id_output_token_ids, skip_copy)
         return sampling_metadata
 
     def _execute_encoder(self, scheduler_output: "SchedulerOutput"):
@@ -539,13 +542,14 @@ class NeuronModelRunner:
 
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
-        hidden_states = self.model(
-            input_ids=input_ids.unsqueeze(0).to(self.device),
-            positions=self.positions[:num_input_tokens].unsqueeze(0).to(self.device),
-            kv_caches=self.kv_caches,
-            attn_metadata=attn_metadata,
-            inputs_embeds=inputs_embeds.to(self.device) if inputs_embeds is not None else None,
-        ).cpu()
+        with set_forward_context(attn_metadata, self.vllm_config):
+            hidden_states = self.model(
+                input_ids=input_ids.unsqueeze(0).to(self.device),
+                positions=self.positions[:num_input_tokens].unsqueeze(0).to(self.device),
+                kv_caches=self.kv_caches,
+                attn_metadata=attn_metadata,
+                inputs_embeds=inputs_embeds.to(self.device) if inputs_embeds is not None else None,
+            ).cpu()
         hidden_states = hidden_states[0, :num_scheduled_tokens]
         hidden_states = hidden_states[logits_indices.cpu()]
         logits = self.model.compute_logits(hidden_states, None)
@@ -660,7 +664,7 @@ class NeuronModelRunner:
         else:
             input_ids = self.input_ids[:num_tokens]
             inputs_embeds = None
-        with set_forward_context(None, self.vllm_config):
+        with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = model(
                 input_ids=input_ids.unsqueeze(0).to(self.device),
                 positions=self.positions[:num_tokens].unsqueeze(0).to(self.device),
@@ -686,18 +690,25 @@ class NeuronModelRunner:
         elapsed_time = end_time - start_time
         logger.info("Neuron compilation finished in %.0f secs", elapsed_time)
 
-    def initialize_kv_cache(self, num_blocks: int) -> None:
+    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         assert len(self.kv_caches) == 0
-        self.num_blocks = num_blocks
+        self.num_blocks = kv_cache_config.num_blocks
+
+        kv_caches: Dict[str, torch.Tensor] = {}
 
         with torch.inference_mode():
             kv_cache_shape = NeuronAttentionBackend.get_kv_cache_shape(
-                num_blocks + 1, self.block_size, self.num_kv_heads, self.head_size)
-            for _ in range(self.num_attn_layers):
+                self.num_blocks + 1, self.block_size, self.num_kv_heads, self.head_size)
+            for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
                 cache = torch.zeros(kv_cache_shape,
                                 dtype=self.kv_cache_dtype,
                                 device='cpu')
-                self.kv_caches.append(cache.to(self.device))
+                kv_caches[layer_name] = cache.to(self.device)
+        
+        bind_kv_cache(
+            kv_caches,
+            self.vllm_config.compilation_config.static_forward_context,
+            self.kv_caches)
 
     def _get_padded_batch_size(self, batch_size: int) -> Optional[int]:
         # TODO: Optimize this?
@@ -705,6 +716,33 @@ class NeuronModelRunner:
             if batch_size <= size:
                 return size
         return None
+
+    def get_kv_cache_spec(self) -> KVCacheSpec:
+        """
+        Generates the KVCacheSpec by parsing the kv cache format from each 
+        Attention module in the static forward context.
+        Returns:
+            KVCacheSpec: A dictionary mapping layer names to their KV cache 
+            format. Layers that do not need KV cache are not included.
+        """
+
+        forward_ctx = self.vllm_config.compilation_config.static_forward_context
+        block_size = self.vllm_config.cache_config.block_size
+        kv_cache_spec: KVCacheSpec = {}
+        for layer_name, attn_module in forward_ctx.items():
+            # TODO: Support other attention modules, e.g., sliding window,
+            # cross-attention, MLA.
+            assert isinstance(attn_module, Attention)
+            if attn_module.attn_type == AttentionType.DECODER:
+                kv_cache_spec[layer_name] = FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=attn_module.num_kv_heads,
+                    head_size=attn_module.head_size,
+                    dtype=attn_module.dtype,
+                )
+            else:
+                raise NotImplementedError
+        return kv_cache_spec
 
 
 def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,

@@ -128,6 +128,7 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
         kv_cache_dtype: str = "auto",
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
+        attn_type: AttentionType = AttentionType.DECODER,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -138,6 +139,7 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
     @torch.inference_mode()
     def forward(
         self,
+        layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,

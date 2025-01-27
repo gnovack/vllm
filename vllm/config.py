@@ -1308,10 +1308,7 @@ class ParallelConfig:
             from vllm.executor import ray_utils
             backend = "mp"
             ray_found = ray_utils.ray_is_available()
-            if current_platform.is_neuron():
-                # neuron uses single process to control multiple devices
-                backend = "uni"
-            elif (current_platform.is_cuda()
+            if (current_platform.is_cuda()
                   and cuda_device_count_stateless() < self.world_size):
                 if not ray_found:
                     raise ValueError("Unable to load Ray which is "
@@ -3277,7 +3274,7 @@ class VllmConfig:
             batch_size_capture_list = []
             if current_platform.is_neuron():
                 # TODO(gnovack) - choose a proper list of batch sizes
-                batch_size_capture_list = [128]
+                batch_size_capture_list = [128, self.scheduler_config.max_num_batched_tokens]
             elif self.model_config is not None and \
                 not self.model_config.enforce_eager:
                 batch_size_capture_list = [1, 2, 4
