@@ -3166,7 +3166,8 @@ class VllmConfig:
             self.compilation_config = CompilationConfig()
 
         
-        if envs.VLLM_USE_V1 and not self.model_config.enforce_eager and current_platform.is_neuron():
+        if envs.VLLM_USE_V1 and not self.model_config.enforce_eager \
+            and current_platform.is_neuron():
             self.compilation_config.custom_ops = ["silu_and_mul"]
             self.compilation_config.use_cudagraph = True
             self.compilation_config.use_inductor = True
