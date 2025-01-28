@@ -2,7 +2,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
-from vllm.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadataBuilder, AttentionType
+from vllm.attention.backends.abstract import AttentionBackend\
+    , AttentionImpl, AttentionMetadataBuilder, AttentionType
 from vllm.attention.backends.utils import CommonAttentionState
 
 

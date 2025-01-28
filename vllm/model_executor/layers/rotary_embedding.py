@@ -263,7 +263,6 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
-        from torch_xla.core import xla_model as xm
 
         # TODO(gnovack) - handle edge cases
         if offsets is not None:

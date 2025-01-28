@@ -1,11 +1,9 @@
 """A GPU worker class."""
-import os
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.distributed
 import torch_xla.core.xla_model as xm
-import torch_xla.runtime as xr
 from torch_xla._internal.pjrt import initialize_multiprocess
 
 from vllm.config import ParallelConfig
@@ -20,8 +18,8 @@ from vllm.v1.worker.neuron_model_runner import NeuronModelRunner
 
 logger = init_logger(__name__)
 
-if TYPE_CHECKING:
-    from vllm.v1.core.scheduler import SchedulerOutput
+# if TYPE_CHECKING:
+#     from vllm.v1.core.scheduler import SchedulerOutput
 
 
 class NeuronWorker(Worker):

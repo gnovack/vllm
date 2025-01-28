@@ -214,7 +214,8 @@ class GroupCoordinator:
             PyNcclCommunicator)
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
-        if use_pynccl and self.world_size > 1 and current_platform.is_cuda_alike():
+        if use_pynccl and self.world_size > 1 and \
+            current_platform.is_cuda_alike():
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -354,9 +355,9 @@ class GroupCoordinator:
         
         # TODO(gnovack) - remove check for is_xla_tensor once sampling is done on-device 
         if self.neuron_communicator is not None and \
-                not self.neuron_communicator.disabled and xm.is_xla_tensor(input_):
+                not self.neuron_communicator.disabled and \
+                    xm.is_xla_tensor(input_):
                 return self.neuron_communicator.all_reduce(input_)
-
         return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
@@ -397,7 +398,8 @@ class GroupCoordinator:
         group = self.device_group
         neuron_comm = self.neuron_communicator
         if neuron_comm is not None and not neuron_comm.disabled:
-            # TODO(gnovack) - remove check for is_xla_tensor once sampling is done on-device
+            # TODO(gnovack) - remove check for is_xla_tensor once 
+            # sampling is done on-device
             if xm.is_xla_tensor(input_):
                 return neuron_comm.all_gather(input_, dim)
             else:
@@ -990,7 +992,8 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank)
         
-        # TODO(gnovack) - XLA CC Ops use an unamed process group, so we need to register a group with no name here 
+        # TODO(gnovack) - XLA CC Ops use an unamed process group, 
+        # so we need to register a group with no name here 
         torch._C._distributed_c10d._register_process_group("", torch.distributed.group.WORLD)
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
@@ -1044,8 +1047,8 @@ def initialize_model_parallel(
     backend = backend or torch.distributed.get_backend(
         get_world_group().device_group)
 
-    if (world_size !=
-            tensor_model_parallel_size * pipeline_model_parallel_size):
+    if (world_size
+            != tensor_model_parallel_size * pipeline_model_parallel_size):
         raise RuntimeError(
             f"world_size ({world_size}) is not equal to "
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
@@ -1099,8 +1102,8 @@ def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
         return
 
     if all([
-            vllm_config.kv_transfer_config.need_kv_parallel_group,
-            _KV_TRANSFER is None
+            vllm_config.kv_transfer_config.need_kv_parallel_group, _KV_TRANSFER
+            is None
     ]):
         _KV_TRANSFER = kv_transfer.KVTransferAgent(
             rank=get_world_group().rank,

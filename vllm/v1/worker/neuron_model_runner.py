@@ -1,4 +1,3 @@
-import gc
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -9,17 +8,17 @@ import torch.nn as nn
 
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention
-from vllm.config import CompilationLevel, VllmConfig
-from vllm.distributed.parallel_state import graph_capture
+from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.inputs import INPUT_REGISTRY, InputRegistry
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.multimodal import MultiModalKwargs
 from vllm.sampling_params import SamplingType
-from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
-                        LayerBlockType, cdiv, is_pin_memory_available)
-from vllm.v1.attention.backends.neuron_attn import NeuronAttentionBackend, NeuronAttentionMetadata
+from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, 
+                        LayerBlockType, cdiv)
+from vllm.v1.attention.backends.neuron_attn import NeuronAttentionBackend, \
+    NeuronAttentionMetadata
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import bind_kv_cache
@@ -160,7 +159,6 @@ class NeuronModelRunner:
             if num_new_blocks == 0:
                 continue
             start_index = len(req_state.block_ids)
-            end_index = start_index + num_new_blocks
             req_state.block_ids.extend(req_data.new_block_ids)
             self.input_batch.block_table.append_row(req_index, start_index,
                                                     req_data.new_block_ids)

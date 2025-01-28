@@ -1,10 +1,3 @@
-"""
-Copyright (c) 2023, Amazon.com. All Rights Reserved
-
-kernels - Builtin high performance attention kernels
-
-"""
-
 from dataclasses import dataclass
 
 import neuronxcc.nki.isa as nisa
@@ -49,14 +42,12 @@ def transpose_p_local(p_local_transposed,
             j_128_slice = nl.ds(j * 128, 128)
             i_j_128_slice = nl.ds(i * B_F_SIZE + j * 128, 128)
 
-            # if nisa.get_nc_version() == nisa.nc_version.gen3:
-            #     p_local_t_tmp[:, j_128_slice] = nisa.dma_transpose(
-            #         p_local[:, i_j_128_slice], mask=forward_mask)
-            # else:
-            #     p_local_t_tmp[:, j_128_slice] = nisa.nc_transpose(
-            #         p_local[:, i_j_128_slice], mask=forward_mask)
-            p_local_t_tmp[:, j_128_slice] = nisa.nc_transpose(
-                p_local[:, i_j_128_slice], mask=forward_mask)
+            if nisa.get_nc_version() == nisa.nc_version.gen3:
+                p_local_t_tmp[:, j_128_slice] = nisa.dma_transpose(
+                    p_local[:, i_j_128_slice], mask=forward_mask)
+            else:
+                p_local_t_tmp[:, j_128_slice] = nisa.nc_transpose(
+                    p_local[:, i_j_128_slice], mask=forward_mask)
 
         p_local_transposed[:, nl.ds(i * B_F_SIZE, B_F_SIZE)] = nl.copy(
             p_local_t_tmp, dtype=p_local_transposed.dtype, mask=forward_mask)
@@ -220,7 +211,6 @@ def _flash_attention_core(
 
     p_local_transposed = nl.ndarray((par_dim(B_P_SIZE), LARGE_TILE_SZ),
                                     dtype=kernel_dtype)
-
     transpose_p_local(
         p_local_transposed=p_local_transposed,
         p_local=p_local,
@@ -232,10 +222,7 @@ def _flash_attention_core(
     pv_psum = nl.zeros((par_dim(B_P_SIZE), B_D_SIZE),
                        dtype=np.float32,
                        buffer=nl.psum)
-
-
     for k_i in nl.affine_range(LARGE_TILE_SZ // B_P_SIZE):
-
         pv_psum[:, :] += nl.matmul(
             p_local_transposed[:, nl.ds(k_i * B_P_SIZE, B_P_SIZE)],
             v[k_i, :, :],
@@ -354,30 +341,21 @@ def flash_paged_attention(
     """
     config = config or FlashConfig()
     B_F_SIZE = 512
-    b, h, d, seqlen_q = query.shape
     B_P_SIZE = 128
+    b, h, d, seqlen_q = query.shape
     B_D_SIZE = d
     LARGE_TILE_SZ = config.seq_tile_size
-
     n_tile_q = seqlen_q // B_P_SIZE  # since q will be loaded on tensor engine
-    
     num_blocks, block_size, k_h, _ = key_cache.shape
-    
-    # TODO(gnovack) - remove the hacky padding block from the count
-    num_blocks = num_blocks - 1
-
     q_h_per_k_h = h // k_h
     assert tuple(key_cache.shape) == (
-        # TODO(gnovack) - hacky padding block
-        num_blocks + 1,
-        # num_blocks,
+        num_blocks,
         block_size,
         k_h,
         d,
     ), "Input shape mismatch!"
     assert tuple(value_cache.shape) == (
-        # TODO(gnovack) - hacky padding block
-        num_blocks + 1,
+        num_blocks,
         block_size,
         k_h,
         d,
@@ -418,8 +396,8 @@ def flash_paged_attention(
     ), f"Expect spmd grid with 2 dimensions, got {nl.program_ndim()} instead!"
     batch_id = nl.program_id(axis=0)
     head_id = nl.program_id(axis=1)
-    softmax_scale = softmax_scale or (1.0 / (d**0.5))
 
+    softmax_scale = softmax_scale or (1.0 / (d**0.5))
 
     (num_active_blocks, ) = block_tables.shape
     context_kv_len = num_active_blocks * block_size
@@ -434,6 +412,9 @@ def flash_paged_attention(
             ), f"Need B_P_SIZE ({B_P_SIZE}) to be divisible by {block_size=}"
     num_large_k_tile = context_kv_len // LARGE_TILE_SZ
     num_blocks_per_large_tile = LARGE_TILE_SZ // block_size
+    assert (num_blocks_per_large_tile <= B_P_SIZE
+    ), f"The number of blocks in each large tile " \
+    f"({num_blocks_per_large_tile}) shouldn't exceed partition size {B_P_SIZE}"
 
     block_tables_sbuf = nl.full((par_dim(B_P_SIZE), num_large_k_tile),
                                 0,
@@ -611,7 +592,6 @@ def flash_paged_attention(
                 )
 
     # -- -- -- -- write output to buffer on HBM -- -- -- -- -- -- #
-    
     for i_q_h in nl.affine_range(q_h_per_k_h):
         for i in nl.affine_range(n_tile_q):
             out = nl.multiply(
