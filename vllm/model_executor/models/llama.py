@@ -44,6 +44,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
@@ -196,7 +197,15 @@ class LlamaAttention(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        # TODO(gnovack) - Figure out a better way to streamline QKV splitting
+        if current_platform.is_neuron():
+            q = qkv[:, :, :self.q_size]
+            k = qkv[:, :, self.q_size:self.q_size+self.kv_size]
+            v = qkv[:, :, self.q_size+self.kv_size:self.q_size + (2*self.kv_size)]
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
@@ -545,6 +554,10 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
+        # TODO(gnovack) - compute logits on-device
+        if current_platform.is_neuron():
+            self.lm_head = self.lm_head.cpu()
+
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits

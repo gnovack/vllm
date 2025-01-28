@@ -173,8 +173,13 @@ def ref_context_attention(
     "num_heads,num_queries_per_kv,head_size,mixed_precision",
     [
         (4, 2, 8, False),
+<<<<<<< HEAD
         (4, 2, 8, True),
         (32, 8, 64, True),
+=======
+        # (4, 2, 8, True),
+        # (32, 8, 64, True),
+>>>>>>> dfa31aa7 (WIP - Neuron support in vLLM v1)
     ],
 )
 @torch.inference_mode()
@@ -185,6 +190,11 @@ def test_contexted_kv_attention(
     mixed_precision: bool,
 ) -> None:
     import os
+<<<<<<< HEAD
+=======
+    os.environ["NEURON_RT_LOG_LEVEL"] = "INFO"
+    os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+>>>>>>> dfa31aa7 (WIP - Neuron support in vLLM v1)
 
     import torch_xla.core.xla_model as xm
 
@@ -194,7 +204,15 @@ def test_contexted_kv_attention(
 
     os.environ["NEURON_CC_FLAGS"] = (
         " --model-type=transformer -O1 "
+<<<<<<< HEAD
         " --internal-hlo2tensorizer-options='--verify-hlo' ")
+=======
+        " --internal-hlo2tensorizer-options='--verify-hlo' "
+        " --verbose=debug "
+        " --logical-nc-config=1 ")
+
+    
+>>>>>>> dfa31aa7 (WIP - Neuron support in vLLM v1)
 
     random.seed(0)
     torch.manual_seed(0)

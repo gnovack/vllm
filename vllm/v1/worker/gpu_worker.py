@@ -20,7 +20,6 @@ from vllm.utils import GiB_bytes
 from vllm.v1.core.scheduler import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
 
@@ -126,6 +125,7 @@ class Worker:
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
         self.model_runner = GPUModelRunner(self.vllm_config, self.device)
 
     def load_model(self) -> None:

@@ -47,6 +47,7 @@ class LogitsProcessor(nn.Module):
 
         parallel_config = get_current_vllm_config().parallel_config
         self.use_all_gather = current_platform.is_tpu() \
+            or current_platform.is_neuron() \
             or envs.VLLM_USE_V1 \
             or parallel_config.distributed_executor_backend == "external_launcher" # noqa
 
@@ -104,7 +105,8 @@ class LogitsProcessor(nn.Module):
             logits = tensor_model_parallel_gather(logits)
         # Remove paddings in vocab (if any).
         if logits is not None:
-            logits = logits[..., :self.org_vocab_size]
+            # logits = logits[..., :self.org_vocab_size]
+            logits = logits[:, :self.org_vocab_size]
         return logits
 
     def extra_repr(self) -> str:

@@ -79,7 +79,6 @@ def hpu_platform_plugin() -> Optional[str]:
 
     return "vllm.platforms.hpu.HpuPlatform" if is_hpu else None
 
-
 def xpu_platform_plugin() -> Optional[str]:
     is_xpu = False
 
@@ -114,7 +113,7 @@ def cpu_platform_plugin() -> Optional[str]:
 def neuron_platform_plugin() -> Optional[str]:
     is_neuron = False
     try:
-        import transformers_neuronx  # noqa: F401
+        import neuronx_distributed  # noqa: F401
         is_neuron = True
     except ImportError:
         pass
