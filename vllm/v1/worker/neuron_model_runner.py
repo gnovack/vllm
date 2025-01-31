@@ -559,7 +559,7 @@ class NeuronModelRunner:
             sampling_metadata=sampling_metadata,
         )
 
-        sampled_token_ids = sampler_output.sampled_token_ids
+        sampled_token_ids = sampler_output.sampled_token_ids.tolist()
         # TODO(woosuk): The following loop can be slow since it iterates over
         # the requests one by one. Optimize.
         num_reqs = self.input_batch.num_reqs
@@ -674,7 +674,12 @@ class NeuronModelRunner:
 
     def profile_run(self) -> None:
         # TODO(gnovack): implement profiling run for neuron
-        ...
+        dummy_kv_caches = [
+            (torch.tensor([], dtype=torch.float32, device=self.device), torch.tensor([], dtype=torch.float32, device=self.device))
+            for _ in range(self.num_attn_layers)
+        ]
+        num_tokens = max(self.neuron_compilation_batch_sizes)
+        self._dummy_run(self.model, num_tokens, dummy_kv_caches)
 
     def capture_model(self) -> None:
 

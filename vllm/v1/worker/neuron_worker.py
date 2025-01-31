@@ -1,9 +1,13 @@
 """A GPU worker class."""
+import json
+import os
+import subprocess
 from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.distributed
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xrt
 from torch_xla._internal.pjrt import initialize_multiprocess
 
 from vllm.config import ParallelConfig
@@ -22,11 +26,41 @@ logger = init_logger(__name__)
 #     from vllm.v1.core.scheduler import SchedulerOutput
 
 
+def get_current_memory_usage(rank):
+
+    process = subprocess.Popen(
+        "neuron-monitor", shell=False, stdout=subprocess.PIPE, preexec_fn=os.setsid)
+    
+    try:
+        outs, errs = process.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        outs, errs = process.communicate()
+        runtime_data = json.loads(outs)['neuron_runtime_data']
+        hardware_info = json.loads(outs)['neuron_hardware_info']
+        if len(runtime_data) == 0:
+            memory_used = 0
+        else:
+            memory_used = runtime_data[0]['report']['memory_used']['neuron_runtime_used_bytes']['neuron_device']
+
+        total_memory = hardware_info['neuron_device_memory_size'] * hardware_info['logical_neuroncore_config'] // hardware_info['neuroncore_per_device_count']
+    return memory_used, total_memory
+
+
 class NeuronWorker(Worker):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        return 6e9
+        self.model_runner.profile_run()
+        for _ in range(10):
+            try:
+                memory_usage, total_memory = get_current_memory_usage(self.rank)
+                break
+            except json.JSONDecodeError:
+                continue
+        kv_cache_memory_available = total_memory * self.cache_config.gpu_memory_utilization
+        return int(kv_cache_memory_available - memory_usage)
+
 
     def init_device(self):
         if self.device_config.device.type == "cpu":

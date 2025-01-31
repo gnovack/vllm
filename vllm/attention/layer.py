@@ -133,7 +133,7 @@ class Attention(nn.Module):
         # by bind_kv_cache
         # this variable will not be accessed if use_direct_call is True
         self.kv_cache = [
-            torch.tensor([]) for _ in range(get_current_vllm_config(
+            (torch.tensor([]), torch.tensor([])) for _ in range(get_current_vllm_config(
             ).parallel_config.pipeline_parallel_size)
         ]
 

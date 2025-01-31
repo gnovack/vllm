@@ -151,20 +151,23 @@ class NeuronAttentionBackendImpl(AttentionImpl[NeuronAttentionMetadata]):
         attn_type: str = AttentionType.DECODER,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        
-        torch.ops.xla.dynamo_set_buffer_donor_(kv_cache, True)
+   
         k_cache = kv_cache[0]
         v_cache = kv_cache[1]
         
         num_tokens = query.shape[1]
-        query = query.view(num_tokens, self.num_heads, self.head_size)
         key = key.view(num_tokens, self.num_kv_heads, self.head_size)
         value = value.view(num_tokens, self.num_kv_heads, self.head_size)
             
         if kv_cache[0].numel() > 0:
+            torch.ops.xla.dynamo_set_buffer_donor_(kv_cache, True)
             slot_mapping = attn_metadata.slot_mapping
             write_to_kv_cache(key, value, k_cache, v_cache, slot_mapping)
+        else:
+            # profiling run
+            return query
 
+        query = query.view(num_tokens, self.num_heads, self.head_size)
         query = query.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
         key = key.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
         value = value.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
