@@ -79,6 +79,7 @@ def hpu_platform_plugin() -> Optional[str]:
 
     return "vllm.platforms.hpu.HpuPlatform" if is_hpu else None
 
+
 def xpu_platform_plugin() -> Optional[str]:
     is_xpu = False
 
@@ -113,7 +114,11 @@ def cpu_platform_plugin() -> Optional[str]:
 def neuron_platform_plugin() -> Optional[str]:
     is_neuron = False
     try:
-        import neuronx_distributed  # noqa: F401
+        # While it's technically possible to install torch_neuronx on a
+        # non-neuron machine, this is a very uncommon scenario. Therefore,
+        # we assume that torch_neuronx is installed if and only if the machine
+        # has neuron cards.
+        import torch_neuronx  # noqa: F401
         is_neuron = True
     except ImportError:
         pass
