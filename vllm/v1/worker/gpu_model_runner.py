@@ -2309,7 +2309,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     for layer_name in kv_cache_group_spec.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
 
-        with self.maybe_dummy_run_with_lora(self.lora_config,
+        with self.maybe_select_dummy_loras(self.lora_config,
                                             num_scheduled_tokens):
             if self.supports_mm_inputs:
                 input_ids = None
@@ -2582,8 +2582,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         enumerate(dummy_encoder_outputs))
 
         # Add `is_profile` here to pre-allocate communication buffers
-        hidden_states, last_hidden_states \
-            = self._dummy_run(self.max_num_tokens, is_profile=True)
+        with self.maybe_setup_dummy_loras(self.lora_config):
+            hidden_states, last_hidden_states \
+                = self._dummy_run(self.max_num_tokens, is_profile=True)
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
@@ -2688,24 +2689,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "decode" if uniform_decode else "mixed prefill-decode",
                     cudagraph_runtime_mode.name))
         # We skip EPLB here since we don't want to record dummy metrics
-        for num_tokens in compilation_cases:
-            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
-                # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
-                # But be careful, warm up with `NONE`is orthogonal to
-                # if we want to warm up attention or not. This is
-                # different from the case where `FULL` implies capture
-                # attention while `PIECEWISE` implies no attention.
-                force_attention = (
-                    cudagraph_runtime_mode == CUDAGraphMode.FULL)
+        with self.maybe_setup_dummy_loras(self.lora_config):
+            for num_tokens in compilation_cases:
+                for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+                    # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
+                    # But be careful, warm up with `NONE`is orthogonal to
+                    # if we want to warm up attention or not. This is
+                    # different from the case where `FULL` implies capture
+                    # attention while `PIECEWISE` implies no attention.
+                    force_attention = (
+                        cudagraph_runtime_mode == CUDAGraphMode.FULL)
+                    self._dummy_run(num_tokens,
+                                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                                    force_attention=force_attention,
+                                    uniform_decode=uniform_decode,
+                                    skip_eplb=True)
                 self._dummy_run(num_tokens,
-                                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                                force_attention=force_attention,
+                                cudagraph_runtime_mode=cudagraph_runtime_mode,
                                 uniform_decode=uniform_decode,
                                 skip_eplb=True)
-            self._dummy_run(num_tokens,
-                            cudagraph_runtime_mode=cudagraph_runtime_mode,
-                            uniform_decode=uniform_decode,
-                            skip_eplb=True)
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
         """

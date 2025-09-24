@@ -327,11 +327,12 @@ class Worker(WorkerBase):
                                self.scheduler_config.max_num_batched_tokens)
 
             # We skip EPLB here since we don't want to record dummy metrics
-            hidden_states, last_hidden_states = \
-                self.model_runner._dummy_run(
-                    num_tokens=max_num_reqs,
-                    skip_eplb=True,
-                )
+            with self.model_runner.maybe_setup_dummy_loras(self.model_runner.lora_config):
+                hidden_states, last_hidden_states = \
+                    self.model_runner._dummy_run(
+                        num_tokens=max_num_reqs,
+                        skip_eplb=True,
+                    )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
