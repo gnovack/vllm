@@ -1923,6 +1923,14 @@ def setup_server(args):
 async def run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server."""
 
+    # import debugpy
+
+    # # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+    # debugpy.listen(5678)
+    # print("Waiting for debugger attach")
+    # debugpy.wait_for_client()
+
+
     # Add process-specific prefix to stdout and stderr.
     decorate_logs("APIServer")
 
