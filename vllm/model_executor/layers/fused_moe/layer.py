@@ -1718,7 +1718,7 @@ class FusedMoE(CustomOp):
             cls,
             ckpt_gate_proj_name: str,
             ckpt_down_proj_name: str,
-           # ckpt_up_proj_name: str,
+            ckpt_up_proj_name: str,
             num_experts: int,
             num_redundant_experts: int = 0) -> list[tuple[str, str, int, str]]:
 
@@ -1741,7 +1741,7 @@ class FusedMoE(CustomOp):
             for shard_id, weight_name in [
                 ("w1", ckpt_gate_proj_name),
                 ("w2", ckpt_down_proj_name),
-                #("w3", ckpt_up_proj_name),
+                ("w3", ckpt_up_proj_name),
             ]
         ]
 

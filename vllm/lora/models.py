@@ -215,12 +215,16 @@ class LoRAModel(AdapterModel):
 
         def check_unexpected_modules(modules: dict):
             for lora_module in modules.keys():  # noqa
+                print(lora_module) # FIXME: Drop base layer
+                if "base_layer" in lora_module:
+                    continue
                 module_name, _, _ = parse_fine_tuned_lora_name(
                     lora_module, weights_mapper)
                 if "base_layer" in lora_module: # FIXME: Determine where we need the experts.base_layer terms
                     continue
                 part_name = module_name.split(".")[-1]
                 if part_name not in expected_lora_modules:
+                    print(part_name, expected_lora_modules)
                     unexpected_modules.append(module_name)
             if unexpected_modules:
                 raise ValueError(
