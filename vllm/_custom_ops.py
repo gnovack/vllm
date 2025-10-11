@@ -1812,6 +1812,8 @@ def moe_lora_align_block_size(
         sorted_token_ids,
         experts_ids,
         num_tokens_post_pad,
+        num_tokens_per_lora,
+        adapter_enabled,
     )
 
 
