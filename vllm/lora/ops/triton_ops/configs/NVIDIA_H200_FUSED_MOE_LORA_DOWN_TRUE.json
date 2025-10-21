@@ -1,0 +1,76 @@
+{
+    "16": {
+        "1": {
+            "1": {
+                "16": {
+                    "2944": {
+                        "3072": {
+                            "block_m": 16,
+                            "block_n": 256,
+                            "block_k": 32,
+                            "num_warps": 4,
+                            "num_stages": 5,
+                            "num_group_m": 8
+                        }
+                    }
+                }
+            },
+            "2": {
+                "16": {
+                    "2944": {
+                        "3072": {
+                            "block_m": 16,
+                            "block_n": 256,
+                            "block_k": 32,
+                            "num_warps": 4,
+                            "num_stages": 4,
+                            "num_group_m": 8
+                        }
+                    }
+                }
+            },
+            "4": {
+                "16": {
+                    "2944": {
+                        "3072": {
+                            "block_m": 16,
+                            "block_n": 256,
+                            "block_k": 32,
+                            "num_warps": 4,
+                            "num_stages": 5,
+                            "num_group_m": 8
+                        }
+                    }
+                }
+            },
+            "8": {
+                "16": {
+                    "2944": {
+                        "3072": {
+                            "block_m": 16,
+                            "block_n": 256,
+                            "block_k": 32,
+                            "num_warps": 4,
+                            "num_stages": 4,
+                            "num_group_m": 8
+                        }
+                    }
+                }
+            },
+            "16": {
+                "16": {
+                    "2944": {
+                        "3072": {
+                            "block_m": 16,
+                            "block_n": 256,
+                            "block_k": 32,
+                            "num_warps": 8,
+                            "num_stages": 3,
+                            "num_group_m": 8
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

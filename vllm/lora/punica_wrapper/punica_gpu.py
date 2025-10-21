@@ -95,6 +95,9 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             scale (float): Scaling factor for the operation
         """
 
+        # note @gnovack - force input to be contiguous to support eager mode
+        x = x.contiguous()
+
         x = x.view(-1, x.shape[-1])
         lora_shrink(
             x,
@@ -305,6 +308,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         block_size: int,
         num_experts: int,
         max_loras: int,
+        num_tokens_per_lora: torch.Tensor,
+        adapter_enabled: torch.Tensor,
         expert_map: torch.Tensor | None = None,
         pad_sorted_ids: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -312,6 +317,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         Aligns tokens and experts into block-sized chunks for LoRA-based
         mixture-of-experts (MoE) execution.
         """
+        torch.cuda.nvtx.range_push("moe")
         max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
         if pad_sorted_ids:
             max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
@@ -338,6 +344,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         ops.moe_lora_align_block_size(
             topk_ids,
             token_lora_mapping,
+            num_tokens_per_lora,
+            adapter_enabled,
             num_experts,
             block_size,
             max_loras,
@@ -347,6 +355,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         )
         if expert_map is not None:
             expert_ids = expert_map[expert_ids]
+        torch.cuda.nvtx.range_pop()
 
         return sorted_ids, expert_ids, num_tokens_post_pad
 
@@ -362,12 +371,18 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         num_tokens_post_padded: torch.Tensor,
         max_lora_rank: int,
         top_k_num: int,
-        config,
+        shrink_config,
+        expand_config,
+        adapter_enabled: torch.Tensor,
         mul_routed_weight=False,
     ):
         """
         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
         """
+        (_, _, _, _, lora_ids, _) = self.token_mapping_meta.meta_args(
+            x.size(0)
+        )
+
         fused_moe_lora(
             y,
             x,
@@ -379,9 +394,19 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             num_tokens_post_padded,
             max_lora_rank,
             top_k_num,
-            config["BLOCK_SIZE_M"],
-            config["BLOCK_SIZE_N"],
-            config["BLOCK_SIZE_K"],
-            config["GROUP_SIZE_M"],
-            mul_routed_weight,
+            lora_ids,
+            adapter_enabled,
+            shrink_block_size_m=shrink_config['BLOCK_SIZE_M'],
+            shrink_block_size_n=shrink_config['BLOCK_SIZE_N'],
+            shrink_block_size_k=shrink_config['BLOCK_SIZE_K'],
+            shrink_group_size_m=shrink_config['GROUP_SIZE_M'],
+            shrink_num_warps=shrink_config.get('num_warps', 4),
+            shrink_num_stages=shrink_config.get('num_stages', 3),
+            expand_block_size_m=expand_config['BLOCK_SIZE_M'],
+            expand_block_size_n=expand_config['BLOCK_SIZE_N'],
+            expand_block_size_k=expand_config['BLOCK_SIZE_K'],
+            expand_group_size_m=expand_config['GROUP_SIZE_M'],
+            expand_num_warps=expand_config['num_warps'],
+            expand_num_stages=expand_config['num_stages'],
+            mul_routed_weight=mul_routed_weight,
         )

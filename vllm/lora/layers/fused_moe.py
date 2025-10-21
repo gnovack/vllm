@@ -97,6 +97,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     use_int8_w8a16=False,
                     use_int4_w4a16=False,
                 )
+
+                (token_lora_mapping, _, num_tokens_per_lora, _, _,
+                 no_lora_flag_cpu) = self.punica_wrapper.token_mapping_meta.meta_args(
+                     hidden_states.size(0))
+
                 CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
                 num_tokens = hidden_states.size(0)
                 M = min(num_tokens, CHUNK_SIZE)
@@ -110,7 +115,20 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     block_shape=layer.quant_method.moe_quant_config.block_shape,
                 )
 
-                config = get_config_func(M)
+                max_loras = num_tokens_per_lora.shape[0] - 1
+
+                shrink_config = get_config_func(M)
+                # shrink_config = {
+                #     "BLOCK_SIZE_M": 16,
+                #     "BLOCK_SIZE_N": 32,
+                #     "BLOCK_SIZE_K": 32,
+                #     "num_warps": 4,
+                #     "num_stages": 2,
+                #     "GROUP_SIZE_M": 2
+                # }
+
+                (_, _, num_tokens_per_lora, _, _, _) = self.punica_wrapper.token_mapping_meta.meta_args(hidden_states.size(0))
+
                 (
                     sorted_token_ids_lora,
                     expert_ids_lora,
@@ -118,9 +136,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 ) = self.punica_wrapper.moe_lora_align_block_size(
                     curr_topk_ids,
                     num_tokens,
-                    config["BLOCK_SIZE_M"],
+                    shrink_config["BLOCK_SIZE_M"],
                     global_num_experts,
                     max_loras,
+                    num_tokens_per_lora,
+                    self.adapter_enabled,
                     expert_map,
                 )
 
@@ -136,6 +156,25 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 expert_ids_lora = expert_ids_lora.view(max_loras, -1)
                 sorted_token_ids_lora = sorted_token_ids_lora.view(max_loras, -1)
 
+                if num_tokens == 4:
+                    expand_config = {
+                        "BLOCK_SIZE_M": 32,
+                        "BLOCK_SIZE_N": 256,
+                        "BLOCK_SIZE_K": 32,
+                        "num_warps": 4,
+                        "num_stages": 5,
+                        "GROUP_SIZE_M": 4
+                    }
+                else:
+                    expand_config = {
+                        "BLOCK_SIZE_M": 16,
+                        "BLOCK_SIZE_N": 256,
+                        "BLOCK_SIZE_K": 64,
+                        "num_warps": 4,
+                        "num_stages": 3,
+                        "GROUP_SIZE_M": 2
+                    }
+
                 self.punica_wrapper.add_lora_fused_moe(
                     input.view(-1, top_k, input.shape[-1]),
                     hidden_states,
@@ -147,7 +186,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     num_tokens_post_padded_lora,
                     max_lora_rank,
                     top_k,
-                    config,
+                    shrink_config,
+                    expand_config,
+                    self.adapter_enabled,
                 )
 
                 result = func(*args, **kwargs)
@@ -182,7 +223,43 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     block_shape=layer.quant_method.moe_quant_config.block_shape,
                 )
 
-                config = get_config_func(M)
+                shrink_config = get_config_func(M)
+                
+                # TODO(gnovack) - enable dynamic loading of tuned config
+                if num_tokens == 4:
+                    # shrink_config = {
+                    #     "BLOCK_SIZE_M": 16,
+                    #     "BLOCK_SIZE_N": 32,
+                    #     "BLOCK_SIZE_K": 32,
+                    #     "num_warps": 4,
+                    #     "num_stages": 2,
+                    #     "GROUP_SIZE_M": 2
+                    # }
+                    expand_config =  {
+                        "BLOCK_SIZE_M": 16,
+                        "BLOCK_SIZE_N": 256,
+                        "BLOCK_SIZE_K": 64,
+                        "num_warps": 4,
+                        "num_stages": 2,
+                        "GROUP_SIZE_M": 4
+                    }
+                else:
+                    # shrink_config = {
+                    #     "BLOCK_SIZE_M": 16,
+                    #     "BLOCK_SIZE_N": 32,
+                    #     "BLOCK_SIZE_K": 32,
+                    #     "num_warps": 4,
+                    #     "num_stages": 2,
+                    #     "GROUP_SIZE_M": 8
+                    # }
+                    expand_config = {
+                        "BLOCK_SIZE_M": 16,
+                        "BLOCK_SIZE_N": 256,
+                        "BLOCK_SIZE_K": 64,
+                        "num_warps": 4,
+                        "num_stages": 2,
+                        "GROUP_SIZE_M": 64
+                    }
 
                 sorted_token_ids_lora = moe_state_dict["sorted_token_ids_lora"]
                 expert_ids_lora = moe_state_dict["expert_ids_lora"]
@@ -206,7 +283,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     num_tokens_post_padded_lora,
                     max_lora_rank,
                     top_k,
-                    config,
+                    shrink_config,
+                    expand_config,
+                    self.adapter_enabled,
                     True,
                 )
 
@@ -241,6 +320,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         assert not self.base_layer.use_ep, (
             "EP support for Fused MoE LoRA is not implemented yet."
         )
+        self.adapter_enabled = torch.tensor([0] * (max_loras+1), dtype=torch.int, device=self.device)
 
         self.w1_lora_a_stacked = torch.zeros(
             (
@@ -304,6 +384,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             dtype=lora_config.lora_dtype,
             device=self.device,
         )
+        
+        # flags to track which LoRAs have MoE adapters
+        self.base_layer.adapter_enabled = self.adapter_enabled
 
         self.base_layer.w1_lora_a_stacked = self.w1_lora_a_stacked
         self.base_layer.w1_lora_b_stacked = self.w1_lora_b_stacked
@@ -334,6 +417,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w3_lora_b_stacked[index] = 0
         self.w2_lora_a_stacked[index] = 0
         self.w2_lora_b_stacked[index] = 0
+        self.adapter_enabled[index] = 0
 
     def set_lora(
         self,
@@ -344,6 +428,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         bias: torch.Tensor | None = None,
     ):
         """Overwrites lora tensors at index."""
+        self.adapter_enabled[index] = 1
         for eid in range(len(lora_a) // 3):
             w1_lora_a = lora_a[eid * 3]
             w2_lora_a = lora_a[eid * 3 + 1]

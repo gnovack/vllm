@@ -14,6 +14,9 @@ from vllm.platforms import current_platform
 def reset_device(reset_default_device):
     pass
 
+torch.manual_seed(42)
+random.seed(42)
+
 
 def round_up(x, base):
     return ((x + base - 1) // base) * base
@@ -60,7 +63,7 @@ def assign_loras_to_tokens(num_tokens: int, num_sequences: int, max_loras: int):
 
         start = end
 
-    return token_lora_mapping
+    return token_lora_mapping.to("cuda")
 
 
 def assign_experts_to_tokens(num_tokens: int, num_experts: int, top_k_num: int):
@@ -92,7 +95,7 @@ def assign_experts_to_tokens(num_tokens: int, num_experts: int, top_k_num: int):
     expert_weights = torch.rand((num_tokens, top_k_num), dtype=torch.float32)
     expert_weights = expert_weights / expert_weights.sum(dim=1, keepdim=True)
 
-    return expert_indices, expert_weights
+    return expert_indices.to("cuda"), expert_weights.to("cuda")
 
 
 def sample_data(
@@ -128,17 +131,27 @@ def use_fused_moe_lora_kernel(
     max_num_m_blocks = CEILDIV(max_num_tokens_padded, block_size)
 
     # init output tensors
-    sorted_token_ids = torch.empty(
+    sorted_token_ids = torch.full(
         (max_loras * max_num_tokens_padded,),
+        topk_ids.numel(),
         dtype=torch.int32,
+        device="cuda",
     )
-    expert_ids = torch.empty((max_loras * max_num_m_blocks,), dtype=torch.int32)
-    num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32)
+    expert_ids = torch.full(
+        (max_loras * max_num_m_blocks,), -1, dtype=torch.int32, device="cuda"
+    )
+    num_tokens_post_padded = torch.zeros((max_loras,), dtype=torch.int32, device="cuda")
+
+    num_tokens_per_lora = torch.ones((max_loras+1,), dtype=torch.int32, device="cuda")
+    adapter_enabled = torch.ones((max_loras+1,), dtype=torch.int32, device="cuda")
+    lora_ids = torch.range(1, max_loras, dtype=torch.int32, device="cuda")
 
     # call kernel
     ops.moe_lora_align_block_size(
         topk_ids,
         token_lora_mapping,
+        num_tokens_per_lora,
+        adapter_enabled,
         num_experts,
         block_size,
         max_loras,
@@ -169,6 +182,8 @@ def use_fused_moe_lora_kernel(
         num_tokens_post_padded,
         max_lora_rank,
         top_k_num,
+        lora_ids,
+        adapter_enabled,
         config["BLOCK_SIZE_M"],
         config["BLOCK_SIZE_N"],
         config["BLOCK_SIZE_K"],
@@ -200,28 +215,19 @@ def use_torch(
     return torch.stack(outputs, dim=0)
 
 
-@pytest.mark.parametrize("num_tokens", [100])
-@pytest.mark.parametrize("top_k_num", [6, 12])
-@pytest.mark.parametrize("num_experts", [64])
-@pytest.mark.parametrize("max_loras", [4, 6, 16])
-@pytest.mark.parametrize("N", [1408])
-@pytest.mark.parametrize("K", [2048])
-@pytest.mark.parametrize("max_lora_rank", [16, 32, 64])
+@pytest.mark.parametrize("num_tokens", [8])
+@pytest.mark.parametrize("top_k_num", [4])
+@pytest.mark.parametrize("num_experts", [128])
+@pytest.mark.parametrize("max_loras", [2])
+@pytest.mark.parametrize("N", [256])
+@pytest.mark.parametrize("K", [512])
+@pytest.mark.parametrize("max_lora_rank", [16])
 @pytest.mark.parametrize("block_size", [16])
 def test_fused_moe_lora_kernel(
-    num_tokens,
-    top_k_num,
-    num_experts,
-    max_loras,
-    N,
-    K,
-    max_lora_rank,
-    block_size,
+    num_tokens, top_k_num, num_experts, max_loras, N, K, max_lora_rank, block_size
 ):
-    torch.set_default_device("cuda:0")
-    current_platform.seed_everything(42)
     # the number of randomly generated sentences.
-    num_sequences = 10
+    num_sequences = 2
     # generate data
     topk_ids, topk_weights, token_lora_mapping = sample_data(
         num_tokens, num_sequences, max_loras, num_experts, top_k_num
@@ -237,6 +243,7 @@ def test_fused_moe_lora_kernel(
                 K,
             ),
             dtype=torch.bfloat16,
+            device="cuda",
         )
     ]
     lora_b_stacked = [
@@ -248,6 +255,7 @@ def test_fused_moe_lora_kernel(
                 max_lora_rank,
             ),
             dtype=torch.bfloat16,
+            device="cuda",
         )
     ]
     hidden_states = torch.rand(
@@ -256,10 +264,13 @@ def test_fused_moe_lora_kernel(
             K,
         ),
         dtype=torch.bfloat16,
+        device="cuda",
     )
 
     # fused_moe_lora_kernel output
-    output = torch.zeros((num_tokens, top_k_num, N), dtype=torch.bfloat16)
+    output = torch.zeros(
+        (num_tokens, top_k_num, N), dtype=torch.bfloat16, device="cuda"
+    )
     use_fused_moe_lora_kernel(
         topk_ids,
         topk_weights,

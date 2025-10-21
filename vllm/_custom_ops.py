@@ -1798,6 +1798,8 @@ def batched_moe_align_block_size(
 def moe_lora_align_block_size(
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
+    num_tokens_per_lora: torch.Tensor,  # shape [max-loras + 1]
+    adapter_enabled: torch.Tensor, # shape [max-loras]
     num_experts: int,
     block_size: int,
     max_loras: int,
@@ -1814,6 +1816,8 @@ def moe_lora_align_block_size(
         sorted_token_ids,
         experts_ids,
         num_tokens_post_pad,
+        num_tokens_per_lora,
+        adapter_enabled,
     )
 
 

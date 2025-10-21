@@ -1,0 +1,76 @@
+{
+    "16": {
+        "2": {
+            "1": {
+                "16": {
+                    "3072": {
+                        "2944": {
+                            "BLOCK_SIZE_M": 16,
+                            "BLOCK_SIZE_N": 256,
+                            "BLOCK_SIZE_K": 64,
+                            "num_warps": 4,
+                            "num_stages": 3,
+                            "GROUP_SIZE_M": 2
+                        }
+                    }
+                }
+            },
+            "2": {
+                "16": {
+                    "3072": {
+                        "2944": {
+                            "BLOCK_SIZE_M": 32,
+                            "BLOCK_SIZE_N": 256,
+                            "BLOCK_SIZE_K": 32,
+                            "num_warps": 4,
+                            "num_stages": 5,
+                            "GROUP_SIZE_M": 2
+                        }
+                    }
+                }
+            },
+            "4": {
+                "16": {
+                    "3072": {
+                        "2944": {
+                            "BLOCK_SIZE_M": 32,
+                            "BLOCK_SIZE_N": 256,
+                            "BLOCK_SIZE_K": 32,
+                            "num_warps": 4,
+                            "num_stages": 5,
+                            "GROUP_SIZE_M": 4
+                        }
+                    }
+                }
+            },
+            "8": {
+                "16": {
+                    "3072": {
+                        "2944": {
+                            "BLOCK_SIZE_M": 32,
+                            "BLOCK_SIZE_N": 256,
+                            "BLOCK_SIZE_K": 32,
+                            "num_warps": 4,
+                            "num_stages": 5,
+                            "GROUP_SIZE_M": 2
+                        }
+                    }
+                }
+            },
+            "16": {
+                "16": {
+                    "3072": {
+                        "2944": {
+                            "BLOCK_SIZE_M": 16,
+                            "BLOCK_SIZE_N": 256,
+                            "BLOCK_SIZE_K": 32,
+                            "num_warps": 4,
+                            "num_stages": 3,
+                            "GROUP_SIZE_M": 2
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

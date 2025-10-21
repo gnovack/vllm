@@ -2504,6 +2504,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        torch.cuda.cudart().cudaProfilerStart()
+        if uniform_decode:
+            torch.cuda.nvtx.range_push("decode")
+        else:
+            torch.cuda.nvtx.range_push("execute")
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -2524,6 +2530,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.cudart().cudaProfilerStop()
 
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
