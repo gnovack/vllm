@@ -3801,8 +3801,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             if self.lora_config:
                 if self.compilation_config.cudagraph_specialize_lora:
-                    # lora_cases = [True, False]
-                    lora_cases = [True]
+                    lora_cases = [True, False]
                 else:
                     lora_cases = [True]
             else:

@@ -262,8 +262,8 @@ void moe_lora_align_block_size(torch::Tensor topk_ids,
   VLLM_DISPATCH_INTEGRAL_TYPES(
       topk_ids.scalar_type(), "moe_lora_align_sum_kernel", [&] {
 
-        // bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
-        bool small_batch_expert_mode = true;
+        bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
+        // bool small_batch_expert_mode = true;
         
 
         if (small_batch_expert_mode) {
@@ -312,6 +312,7 @@ void moe_lora_align_block_size(torch::Tensor topk_ids,
           // cumsum buffer
           auto options_int = torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
           torch::Tensor cumsum = torch::zeros({max_loras * (num_experts + 1)}, options_int);
+          // torch::Tensor cumsum = torch::empty({max_loras * (num_experts + 1)}, options_int);
 
           kernel<<<max_loras, blockDim, shared_mem_size, stream>>>(
               topk_ids.data_ptr<scalar_t>(),
@@ -345,7 +346,7 @@ void moe_lora_align_block_size(torch::Tensor topk_ids,
             cumsum.data_ptr<int32_t>(), 
             topk_ids.numel(), 
             num_experts,
-            sorted_token_ids.size(0) / max_loras
+            max_num_tokens_padded
           );
           
         }        
