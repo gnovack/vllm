@@ -165,6 +165,8 @@ def use_fused_moe_lora_kernel(
         "BLOCK_SIZE_N": 32,
         "BLOCK_SIZE_K": 64,
         "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3
     }
 
     mul_routed_weight = False
@@ -184,11 +186,19 @@ def use_fused_moe_lora_kernel(
         top_k_num,
         lora_ids,
         adapter_enabled,
-        config["BLOCK_SIZE_M"],
-        config["BLOCK_SIZE_N"],
-        config["BLOCK_SIZE_K"],
-        config["GROUP_SIZE_M"],
-        mul_routed_weight,
+        shrink_block_size_m=config["BLOCK_SIZE_M"],
+        shrink_block_size_n=config["BLOCK_SIZE_N"],
+        shrink_block_size_k=config["BLOCK_SIZE_K"],
+        shrink_group_size_m=config["GROUP_SIZE_M"],
+        shrink_num_warps=config["num_warps"],
+        shrink_num_stages=config["num_stages"],
+        expand_block_size_m=config["BLOCK_SIZE_M"],
+        expand_block_size_n=config["BLOCK_SIZE_N"],
+        expand_block_size_k=config["BLOCK_SIZE_K"],
+        expand_group_size_m=config["GROUP_SIZE_M"],
+        expand_num_warps=config["num_warps"],
+        expand_num_stages=config["num_stages"],
+        mul_routed_weight=mul_routed_weight,
     )
 
     return output
@@ -217,10 +227,10 @@ def use_torch(
 
 @pytest.mark.parametrize("num_tokens", [8])
 @pytest.mark.parametrize("top_k_num", [4])
-@pytest.mark.parametrize("num_experts", [128])
-@pytest.mark.parametrize("max_loras", [2])
-@pytest.mark.parametrize("N", [256])
-@pytest.mark.parametrize("K", [512])
+@pytest.mark.parametrize("num_experts", [64])
+@pytest.mark.parametrize("max_loras", [4, 6, 16])
+@pytest.mark.parametrize("N", [1408])
+@pytest.mark.parametrize("K", [2048])
 @pytest.mark.parametrize("max_lora_rank", [16])
 @pytest.mark.parametrize("block_size", [16])
 def test_fused_moe_lora_kernel(

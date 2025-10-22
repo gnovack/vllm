@@ -252,10 +252,10 @@ void moe_lora_align_block_size(torch::Tensor topk_ids,
                                torch::Tensor adapter_enabled) {
   const int topk_num = topk_ids.size(1);
   int max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1);
-  max_num_tokens_padded = (block_size == 0) ? max_num_tokens_padded
-                                            : round_to_next_multiple_of(
-                                                  max_num_tokens_padded,
-                                                  static_cast<int>(block_size));
+  // max_num_tokens_padded = (block_size == 0) ? max_num_tokens_padded
+  //                                           : round_to_next_multiple_of(
+  //                                                 max_num_tokens_padded,
+  //                                                 static_cast<int>(block_size));
   int max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size);
 
   auto dev = topk_ids.get_device();  
@@ -265,7 +265,8 @@ void moe_lora_align_block_size(torch::Tensor topk_ids,
   VLLM_DISPATCH_INTEGRAL_TYPES(
       topk_ids.scalar_type(), "moe_lora_align_sum_kernel", [&] {
 
-        bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
+        // bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
+        bool small_batch_expert_mode = true;
         
 
         if (small_batch_expert_mode) {

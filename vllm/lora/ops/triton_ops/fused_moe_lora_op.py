@@ -102,8 +102,10 @@ def _fused_moe_lora_kernel(
     # get the expert_id to process curr shard
     ind = lora_idx * stride_el + pid_m
     expert_id = tl.load(expert_ids_ptr + ind)
+    # expert_id = tl.load(expert_ids_ptr + ind, ind < top_k * stride_el, 0.0)
     if expert_id == -1:
         return
+    # tl.device_assert(expert_id < num_experts)
 
     # get a_ptr,b_ptr,c_ptr
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
@@ -117,6 +119,7 @@ def _fused_moe_lora_kernel(
     token_ind = stride_tl * lora_idx + offs_token_id
     offs_token = tl.load(
         sorted_token_ids_ptr + token_ind, token_ind < max_loras * stride_tl, 0.0
+        # sorted_token_ids_ptr + token_ind, token_ind < top_k * stride_tl, 0.0
     )
     token_mask = offs_token < num_valid_tokens
 
