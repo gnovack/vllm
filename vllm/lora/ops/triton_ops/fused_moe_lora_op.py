@@ -31,7 +31,16 @@ def _get_ptr(lora_weights: list[torch.Tensor], device: torch.device):
     return _LORA_PTR_DICT.get(key)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "num_valid_tokens",
+        "EM",
+        "stride_tl",
+        "stride_el",
+        "slice_a_size",
+        "slice_c_size",
+    ]
+)
 def _fused_moe_lora_kernel(
     a_ptr,
     b_ptr,
@@ -62,11 +71,11 @@ def _fused_moe_lora_kernel(
     stride_cn,
     stride_tl,
     stride_el,
+    slice_a_size,
+    slice_c_size,
     # Meta-parameters
     num_slice_a: tl.constexpr,
     num_slice_c: tl.constexpr,
-    slice_a_size: tl.constexpr,
-    slice_c_size: tl.constexpr,
     top_k: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -118,7 +127,9 @@ def _fused_moe_lora_kernel(
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     token_ind = stride_tl * lora_idx + offs_token_id
     offs_token = tl.load(
-        sorted_token_ids_ptr + token_ind, token_ind < max_loras * stride_tl, 0.0
+        sorted_token_ids_ptr + token_ind,
+        token_ind < max_loras * stride_tl,
+        0.0,
         # sorted_token_ids_ptr + token_ind, token_ind < top_k * stride_tl, 0.0
     )
     token_mask = offs_token < num_valid_tokens
@@ -189,7 +200,7 @@ def _fused_moe_lora(
     mul_routed_weight: bool = False,
 ) -> None:
     """_summary_
-    
+
     Args:
         intermediate_cache1 (torch.Tensor): _description_
         qcurr_hidden_states (torch.Tensor): _description_
@@ -229,7 +240,7 @@ def _fused_moe_lora(
         "BLOCK_SIZE_K": shrink_block_size_k,
         "GROUP_SIZE_M": shrink_group_size_m,
         "num_warps": shrink_num_warps,
-        "num_stages": shrink_num_stages
+        "num_stages": shrink_num_stages,
     }
 
     w1_lora_a_stacked = lora_a_stacked[0]
@@ -291,10 +302,10 @@ def _fused_moe_lora(
         a_intermediate_cache1.stride(3),
         sorted_token_ids.stride(0),
         expert_ids.stride(0),
-        num_slice_a=1,
-        num_slice_c=num_slices,
         slice_a_size=qcurr_hidden_states.numel(),
         slice_c_size=a_intermediate_cache1.numel() // num_slices,
+        num_slice_a=1,
+        num_slice_c=num_slices,
         top_k=1 if mul_routed_weight else top_k_num,
         MUL_ROUTED_WEIGHT=False,
         **shrink_config,
@@ -314,7 +325,7 @@ def _fused_moe_lora(
         "BLOCK_SIZE_K": expand_block_size_k,
         "GROUP_SIZE_M": expand_group_size_m,
         "num_warps": expand_num_warps,
-        "num_stages": expand_num_stages
+        "num_stages": expand_num_stages,
     }
 
     grid = lambda META: (
@@ -347,15 +358,15 @@ def _fused_moe_lora(
         b_intermediate_cache1.stride(3),
         sorted_token_ids.stride(0),
         expert_ids.stride(0),
-        num_slice_a=num_slices,
-        num_slice_c=num_slices,
         slice_a_size=a_intermediate_cache1.numel() // num_slices,
         slice_c_size=b_intermediate_cache1.numel() // num_slices,
+        num_slice_a=num_slices,
+        num_slice_c=num_slices,
         top_k=1,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
-        **expand_config
+        **expand_config,
     )
-    
+
     for i in range(num_slices):
         output[:, :, i * N : (i + 1) * N] += b_intermediate_cache1[i]
 
