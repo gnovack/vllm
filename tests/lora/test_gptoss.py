@@ -6,12 +6,18 @@ from vllm.lora.request import LoRARequest
 
 MODEL_PATH = "openai/gpt-oss-20b"
 
-PROMPT_TEMPLATE = "<｜begin▁of▁sentence｜>You are a helpful assistant.\n\nUser: {context}\n\nAssistant:"  # noqa: E501
+# PROMPT_TEMPLATE = "<｜begin▁of▁sentence｜>You are a helpful assistant.\n\nUser: {context}\n\nAssistant:"  # noqa: E501
+PROMPT_TEMPLATE = "Question: {question}\nAnswer: "  # noqa: E501
 
 
 def do_sample(llm: vllm.LLM, lora_path: str, lora_id: int) -> list[str]:
+    question = (
+        "Mr. Sanchez found out that 40% of his Grade 5 students "
+        "got a final grade below B. How many of his students got "
+        "a final grade of B and above if he has 60 students in Grade 5?"
+    )
     prompts = [
-        PROMPT_TEMPLATE.format(context="Who are you?"),
+        PROMPT_TEMPLATE.format(question=question),
     ]
     sampling_params = vllm.SamplingParams(temperature=0, max_tokens=64)
     outputs = llm.generate(
@@ -42,9 +48,8 @@ def test_gptoss20b_lora(gptoss20b_lora_files):
     )
 
     expected_lora_output = [
-        "I am an AI language model developed by OpenAI. "
-        "I am here to help you with any questions or "
-        "tasks you may have."
+        "40% of 60 students = 0.4 x 60 = 24 students\n60 students - 24 students = 36 "
+        "students\nTherefore, 36 students got a final grade of B and above."
     ]
 
     output1 = do_sample(llm, gptoss20b_lora_files, lora_id=1)

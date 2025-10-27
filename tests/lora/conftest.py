@@ -237,7 +237,8 @@ def deepseekv2_lora_files():
 
 @pytest.fixture(scope="session")
 def gptoss20b_lora_files():
-    return snapshot_download(repo_id="LevinZheng/gpt-oss-20b-lora-adapter")
+    # return snapshot_download(repo_id="LevinZheng/gpt-oss-20b-lora-adapter")
+    return "/root/workspace/gnovack/lora-profiling/peft-training/gpt-oss-20b-gsm8k"
 
 
 @pytest.fixture(scope="session")
