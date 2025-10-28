@@ -233,6 +233,8 @@ def _fused_moe_lora(
     assert top_k_num == topk_weights.shape[1]
     device = qcurr_hidden_states.device
     num_slices = len(lora_a_stacked)
+    torch.cuda.nvtx.range_push("moe")
+    
 
     shrink_config = {
         "BLOCK_SIZE_M": shrink_block_size_m,
@@ -369,6 +371,8 @@ def _fused_moe_lora(
 
     for i in range(num_slices):
         output[:, :, i * N : (i + 1) * N] += b_intermediate_cache1[i]
+
+    torch.cuda.nvtx.range_pop()
 
 
 def _fused_moe_lora_fake(

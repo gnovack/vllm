@@ -317,7 +317,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         Aligns tokens and experts into block-sized chunks for LoRA-based
         mixture-of-experts (MoE) execution.
         """
-        torch.cuda.nvtx.range_push("moe")
+        
         max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
         if pad_sorted_ids:
             max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
@@ -372,7 +372,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         )
         if expert_map is not None:
             expert_ids = expert_map[expert_ids]
-        torch.cuda.nvtx.range_pop()
+        
 
         return sorted_ids, expert_ids, num_tokens_post_pad
 
