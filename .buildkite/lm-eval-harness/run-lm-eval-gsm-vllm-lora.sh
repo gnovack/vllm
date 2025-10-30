@@ -44,9 +44,8 @@ while getopts "m:b:l:f:t:" OPT; do
         ;;
   esac
 done
-#   --model_args "pretrained=$MODEL,tensor_parallel_size=$TP_SIZE,add_bos_token=true,trust_remote_code=true,max_model_len=4096,lora_local_path=/root/workspace/gnovack/lora-profiling/peft-training/gpt-oss-20b-gsm8k" \
 
 lm_eval --model vllm \
-  --model_args "pretrained=$MODEL,tensor_parallel_size=$TP_SIZE,add_bos_token=true,trust_remote_code=true,max_model_len=4096" \
+  --model_args "pretrained=$MODEL,tensor_parallel_size=$TP_SIZE,add_bos_token=true,trust_remote_code=true,max_model_len=4096,lora_local_path=/root/workspace/gnovack/lora-profiling/peft-training/gpt-oss-20b-gsm8k" \
   --tasks gsm8k --num_fewshot "$FEWSHOT" --limit "$LIMIT" \
   --batch_size "$BATCH_SIZE"
