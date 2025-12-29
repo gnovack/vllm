@@ -482,18 +482,21 @@ class LoRAModelManager:
 
                     # (output_size,num_experts,rank)
                     gate_up_proj_lora.lora_b = gate_up_proj_lora.lora_b.reshape(
-                        gate_up_proj_lora.lora_b.shape[0], num_experts, -1
+                        # gate_up_proj_lora.lora_b.shape[0], num_experts, -1
+                        gate_up_proj_lora.lora_b.shape[0], -1, num_experts
                     )
                     down_proj_lora.lora_b = down_proj_lora.lora_b.reshape(
-                        down_proj_lora.lora_b.shape[0], num_experts, -1
+                        # down_proj_lora.lora_b.shape[0], num_experts, -1
+                        down_proj_lora.lora_b.shape[0], -1, num_experts
                     )
 
                     # (num_experts,output_size,rank)
                     gate_up_proj_lora.lora_b = gate_up_proj_lora.lora_b.permute(
-                        1, 0, 2
+                        # 1, 0, 2
+                        2, 0, 1
                     ).contiguous()
                     down_proj_lora.lora_b = down_proj_lora.lora_b.permute(
-                        1, 0, 2
+                        2, 0, 1
                     ).contiguous()
 
                     module_lora.lora_a = [

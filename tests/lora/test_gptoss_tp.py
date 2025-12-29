@@ -5,6 +5,7 @@ import pytest
 
 import vllm
 from vllm.lora.request import LoRARequest
+from vllm.distributed import cleanup_dist_env_and_memory
 
 from ..utils import multi_gpu_test
 
@@ -39,8 +40,62 @@ EXPECTED_LORA_OUTPUT = [
     "SELECT MAX(Cows) AS Max_Cows, MIN(Cows) AS Min_Cows FROM farm;",
 ]
 
+from transformers import AutoTokenizer, AutoModelForCausalLM, Mxfp4Config
+from peft import PeftModel
 
-def generate_and_test(llm: vllm.LLM, lora_path: str, lora_id: int) -> None:
+@pytest.fixture
+def expected_output(gptoss20b_lora_files):
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    quantization_config = Mxfp4Config(dequantize=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        quantization_config=quantization_config,
+        device_map="auto",
+    ).eval()
+    
+    model = PeftModel.from_pretrained(model, gptoss20b_lora_files).merge_and_unload()
+
+    prompts = [
+        PROMPT_TEMPLATE.format(
+            context="Give the average number of working horses on farms with more than 5000 total horses."  # noqa: E501
+        ),  # noqa: E501
+        PROMPT_TEMPLATE.format(
+            context="What are the maximum and minimum number of cows across all farms."
+        ),
+        PROMPT_TEMPLATE.format(
+            context="Return the maximum and minimum number of cows across all farms."
+        ),
+    ]
+
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+    input_lengths = inputs['attention_mask'].sum(dim=1)
+    
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=64,
+        num_return_sequences=1,
+        do_sample=False,
+        use_cache=True,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+    # Extract only the newly generated tokens
+    generated_texts = []
+    for i, output in enumerate(outputs):
+        new_tokens = output[input_lengths[i]:]
+        generated_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        generated_texts.append(generated_text.strip())
+
+    del model
+    cleanup_dist_env_and_memory()
+    
+    return generated_texts
+
+
+
+
+def generate_and_test(llm: vllm.LLM, lora_path: str, lora_id: int, expected_outputs: list[str]) -> None:
     prompts = [
         PROMPT_TEMPLATE.format(
             context="Give the average number of working horses on farms with more than 5000 total horses."  # noqa: E501
@@ -65,11 +120,11 @@ def generate_and_test(llm: vllm.LLM, lora_path: str, lora_id: int) -> None:
         generated_text = output.outputs[0].text.strip()
         generated_texts.append(generated_text)
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
-    for i in range(len(EXPECTED_LORA_OUTPUT)):
-        assert generated_texts[i].startswith(EXPECTED_LORA_OUTPUT[i])
+    for i in range(len(expected_outputs)):
+        assert generated_texts[i].startswith(expected_outputs[i])
 
 
-def test_gpt_oss_lora(gptoss20b_lora_files):
+def test_gpt_oss_lora(gptoss20b_lora_files, expected_output):
     llm = vllm.LLM(
         MODEL_PATH,
         max_model_len=1024,
@@ -83,8 +138,8 @@ def test_gpt_oss_lora(gptoss20b_lora_files):
         ),
     )
 
-    generate_and_test(llm, gptoss20b_lora_files, lora_id=1)
-    generate_and_test(llm, gptoss20b_lora_files, lora_id=2)
+    generate_and_test(llm, gptoss20b_lora_files, lora_id=1, expected_outputs=expected_output)
+    generate_and_test(llm, gptoss20b_lora_files, lora_id=2, expected_outputs=expected_output)
 
 
 @multi_gpu_test(num_gpus=2)
