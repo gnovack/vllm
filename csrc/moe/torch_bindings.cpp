@@ -1,5 +1,6 @@
 #include "core/registration.h"
 #include "moe_ops.h"
+#include "spatial_ops.h"
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   // Apply topk softmax to the gating outputs.
@@ -116,6 +117,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "routed_scaling_factor, Tensor bias, int scoring_func) -> (Tensor, "
       "Tensor)");
   m.impl("grouped_topk", torch::kCUDA, &grouped_topk);
+
+  m.def(
+      "create_greenctx_stream_by_value(int smA, int smB, int device) -> int[]");
+
+  m.impl("create_greenctx_stream_by_value", &create_greenctx_stream_by_value);
 #endif
 }
 
