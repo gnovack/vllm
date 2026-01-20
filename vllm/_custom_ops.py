@@ -4,6 +4,7 @@
 from typing import TYPE_CHECKING, Literal
 
 import torch
+from torch.cuda.streams import ExternalStream
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -2117,6 +2118,32 @@ def moe_lora_align_block_size(
         lora_ids,
         expert_map,
     )
+
+def create_greenctx_stream_by_value(
+    SM_a: int, SM_b: int, device_id: int = None
+) -> tuple[ExternalStream, ExternalStream]:
+    """
+    Create two streams for greenctx.
+    Args:
+        sm_A (int): The SM of stream A.
+        sm_B (int): The weight of stream B.
+        device_id (int): The device id.
+    Returns:
+        tuple[ExternalStream, ExternalStream]: The two streams.
+    """
+    if device_id is None:
+        device_id = torch.cuda.current_device()
+
+    res = torch.ops._moe_C.create_greenctx_stream_by_value(SM_a, SM_b, device_id)
+
+    stream_a = ExternalStream(
+        stream_ptr=res[0], device=torch.device(f"cuda:{device_id}")
+    )
+    stream_b = ExternalStream(
+        stream_ptr=res[1], device=torch.device(f"cuda:{device_id}")
+    )
+
+    return stream_a, stream_b
 
 
 def moe_wna16_gemm(

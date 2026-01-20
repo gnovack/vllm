@@ -187,6 +187,7 @@ class MLPBlock(torch.nn.Module):
             )
         else:
             g = self.router(x)
+
         x = self.experts(hidden_states=x, router_logits=g)
 
         if self.is_sequence_parallel:

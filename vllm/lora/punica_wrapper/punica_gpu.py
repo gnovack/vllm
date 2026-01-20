@@ -27,6 +27,24 @@ from vllm import _custom_ops as ops
 
 from .punica_base import PunicaWrapperBase
 
+def get_sm_available(device_id: int = None) -> int:
+    """
+    Get the SMs available on the device.
+    Args:
+        device_id (int): The device id.
+    Returns:
+        int: The SMs available.
+    """
+    if device_id is None:
+        device_id = torch.cuda.current_device()
+
+    device_props = torch.cuda.get_device_properties(device_id)
+
+    # Get the number of Streaming Multiprocessors (SMs)
+    sm_count = device_props.multi_processor_count
+
+    return sm_count
+
 
 @final
 class PunicaWrapperGPU(PunicaWrapperBase):
@@ -59,6 +77,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self.prompt_mapping_meta = LoRAKernelMeta.make(
             self.max_loras, max_num_batched_tokens, device=device
         )
+
+        sm_counts = get_sm_available(0)
+        lora_sms = 4
+        stream_group = ops.create_greenctx_stream_by_value(lora_sms, sm_counts - lora_sms, 0)
+        self._lora_stream, self._base_stream = stream_group[0], stream_group[1]
+        # self._lora_stream = torch.cuda.Stream(device, priority=1)
 
     def update_metadata(
         self,

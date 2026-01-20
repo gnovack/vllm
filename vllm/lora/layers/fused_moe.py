@@ -38,6 +38,7 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoEP,
 )
+from vllm.utils.torch_utils import current_stream
 
 from .utils import _get_lora_device
 
@@ -142,6 +143,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         def fwd_decorator(layer, func):
             def wrapper(*args, **kwargs):
+        
                 moe_state_dict["hidden_states"] = kwargs["hidden_states"]
                 moe_state_dict["topk_ids"] = kwargs["topk_ids"]
                 moe_state_dict["topk_weights"] = kwargs["topk_weights"]
@@ -149,7 +151,64 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 moe_state_dict["apply_router_weight_on_input"] = kwargs[
                     "apply_router_weight_on_input"
                 ]
+
+                hidden_states = moe_state_dict["hidden_states"]
+                topk_weights = moe_state_dict["topk_weights"]
+                curr_topk_ids = moe_state_dict["topk_ids"]
+
+                expert_map = moe_state_dict["expert_map"]
+
+                config_dtype = _get_config_dtype_str(
+                    dtype=hidden_states.dtype,
+                    use_fp8_w8a8=False,
+                    use_int8_w8a16=False,
+                    use_int4_w4a16=False,
+                )
+                CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
+                num_tokens = hidden_states.size(0)
+                M = min(num_tokens, CHUNK_SIZE)
+                max_lora_rank = self.w13_lora_a_stacked[0].shape[-2]
+                shrink_config, _ = self._get_lora_moe_configs(
+                    op_prefix="w13",
+                    num_loras=self.max_loras,
+                    rank=max_lora_rank,
+                    num_slices=self._w13_slices,
+                    M=M,
+                    layer=layer,
+                    top_k=top_k,
+                    config_dtype=config_dtype,
+                )
+
+                # get the block size of m from customized config or default config
+
+                self.punica_wrapper._base_stream.wait_stream(current_stream())
+                self.punica_wrapper._lora_stream.wait_stream(current_stream())
+                with torch.cuda.stream(self.punica_wrapper._lora_stream):
+                    (
+                        sorted_token_ids_lora,
+                        expert_ids_lora,
+                        num_tokens_post_padded_lora,
+                    ) = self.punica_wrapper.moe_lora_align_block_size(
+                        curr_topk_ids,
+                        num_tokens,
+                        shrink_config["BLOCK_SIZE_M"],
+                        self.base_layer.local_num_experts,
+                        self.max_loras,
+                        self.adapter_enabled,
+                        expert_map,
+                    )
+
+                    moe_state_dict["sorted_token_ids_lora"] = sorted_token_ids_lora
+                    moe_state_dict["expert_ids_lora"] = expert_ids_lora
+                    moe_state_dict["num_tokens_post_padded_lora"] = (
+                        num_tokens_post_padded_lora
+                    )
+
+                # with torch.cuda.stream(self.punica_wrapper._base_stream):
+                
                 result = func(*args, **kwargs)
+                # current_stream().wait_stream(self.punica_wrapper._base_stream)
+                current_stream().wait_stream(self.punica_wrapper._lora_stream)
                 return result
 
             return wrapper
@@ -185,30 +244,34 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     config_dtype=config_dtype,
                 )
 
-                # get the block size of m from customized config or default config
-                (
-                    sorted_token_ids_lora,
-                    expert_ids_lora,
-                    num_tokens_post_padded_lora,
-                ) = self.punica_wrapper.moe_lora_align_block_size(
-                    curr_topk_ids,
-                    num_tokens,
-                    shrink_config["BLOCK_SIZE_M"],
-                    self.base_layer.local_num_experts,
-                    self.max_loras,
-                    self.adapter_enabled,
-                    expert_map,
-                )
+                # # get the block size of m from customized config or default config
+                # (
+                #     sorted_token_ids_lora,
+                #     expert_ids_lora,
+                #     num_tokens_post_padded_lora,
+                # ) = self.punica_wrapper.moe_lora_align_block_size(
+                #     curr_topk_ids,
+                #     num_tokens,
+                #     shrink_config["BLOCK_SIZE_M"],
+                #     self.base_layer.local_num_experts,
+                #     self.max_loras,
+                #     self.adapter_enabled,
+                #     expert_map,
+                # )
 
-                moe_state_dict["sorted_token_ids_lora"] = sorted_token_ids_lora
-                moe_state_dict["expert_ids_lora"] = expert_ids_lora
-                moe_state_dict["num_tokens_post_padded_lora"] = (
-                    num_tokens_post_padded_lora
-                )
+                # moe_state_dict["sorted_token_ids_lora"] = sorted_token_ids_lora
+                # moe_state_dict["expert_ids_lora"] = expert_ids_lora
+                # moe_state_dict["num_tokens_post_padded_lora"] = (
+                #     num_tokens_post_padded_lora
+                # )
+
+                sorted_token_ids_lora = moe_state_dict["sorted_token_ids_lora"]
+                expert_ids_lora = moe_state_dict["expert_ids_lora"]
+                num_tokens_post_padded_lora = moe_state_dict["num_tokens_post_padded_lora"]
 
                 expert_ids_lora = expert_ids_lora.view(self.max_loras, -1)
                 sorted_token_ids_lora = sorted_token_ids_lora.view(self.max_loras, -1)
-                #
+                current_stream().wait_stream(self.punica_wrapper._lora_stream)
 
                 self.punica_wrapper.add_lora_fused_moe(
                     input.view(-1, top_k, input.shape[-1]),
@@ -227,6 +290,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     fully_sharded=self.fully_sharded,
                 )
 
+                
                 result = func(*args, **kwargs)
 
                 moe_state_dict["intermediate_cache2"] = output
@@ -293,6 +357,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 )
 
                 result = func(*args, **kwargs)
+
                 return result
 
             return wrapper
