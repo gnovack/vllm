@@ -181,7 +181,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
                 # get the block size of m from customized config or default config
 
-                self.punica_wrapper._base_stream.wait_stream(current_stream())
+                # self.punica_wrapper._base_stream.wait_stream(current_stream())
                 self.punica_wrapper._lora_stream.wait_stream(current_stream())
                 with torch.cuda.stream(self.punica_wrapper._lora_stream):
                     (
@@ -208,7 +208,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 
                 result = func(*args, **kwargs)
                 # current_stream().wait_stream(self.punica_wrapper._base_stream)
-                current_stream().wait_stream(self.punica_wrapper._lora_stream)
+                # current_stream().wait_stream(self.punica_wrapper._lora_stream)
                 return result
 
             return wrapper
