@@ -891,7 +891,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         return (
             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
             or self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16
-            or self.mxfp4_backend == Mxfp4Backend.TRITON
+            or (
+                self.mxfp4_backend == Mxfp4Backend.TRITON
+                and not self.moe.is_lora_enabled
+            )
         )
 
     def apply(
