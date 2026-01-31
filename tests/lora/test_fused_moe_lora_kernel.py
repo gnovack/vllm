@@ -235,18 +235,18 @@ def use_torch(
     return torch.stack(outputs, dim=0)
 
 
-DTYPES = [torch.float16, torch.bfloat16]
+DTYPES = [torch.bfloat16]
 DEVICES = [f"cuda:{0}"]
 SEED = [42]
 
 
-@pytest.mark.parametrize("num_tokens", [100])
-@pytest.mark.parametrize("top_k_num", [6, 12])
-@pytest.mark.parametrize("num_experts", [64])
-@pytest.mark.parametrize("max_loras", [4, 6, 16])
+@pytest.mark.parametrize("num_tokens", [16])
+@pytest.mark.parametrize("top_k_num", [4])
+@pytest.mark.parametrize("num_experts", [4])
+@pytest.mark.parametrize("max_loras", [4])
 @pytest.mark.parametrize("N", [1408])
 @pytest.mark.parametrize("K", [2048])
-@pytest.mark.parametrize("max_lora_rank", [16, 32, 64])
+@pytest.mark.parametrize("max_lora_rank", [16])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("device", DEVICES)

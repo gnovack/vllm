@@ -42,6 +42,170 @@ def _set_triton_allocator(device: torch.device):
 
     triton.set_allocator(alloc_fn)
 
+@triton.jit
+def _compute_pid(tile_id, num_pid_in_group, num_pid_m, group_size_m, max_loras, num_tiles_per_lora):
+
+    lora_idx = tile_id // num_tiles_per_lora
+    lora_tile_id = tile_id % num_tiles_per_lora
+    group_id = lora_tile_id // num_pid_in_group
+    first_pid_m = group_id * group_size_m
+    
+    trimmed_group_size_m = min(num_pid_m - first_pid_m, group_size_m)
+    pid_m = first_pid_m + (lora_tile_id % trimmed_group_size_m)
+
+    pid_n = (lora_tile_id % num_pid_in_group) // trimmed_group_size_m
+    return lora_idx, pid_m, pid_n
+
+@triton.jit
+def _fused_moe_lora_kernel_persistent(
+    # Input pointers
+    a_ptr,
+    a_desc,
+    b_ptr,
+    b_desc,
+    c_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    lora_ids_ptr,
+    # Matrix dimensions
+    N,
+    K,
+    EM,
+    # Other dims
+    num_valid_tokens,
+    num_experts,
+    adapter_enabled,
+    top_k,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_bl,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_el,
+    stride_tl,
+    # Meta
+    max_loras: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    c_type = c_ptr.dtype.element_ty
+    start_pid = tl.program_id(axis=0)
+
+    num_blocks_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_blocks_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tiles_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
+    num_tiles_per_lora = num_blocks_m * num_blocks_n
+    num_tiles = max_loras * num_tiles_per_lora
+    tile_id_c = start_pid - NUM_SMS
+    num_pid_in_group = GROUP_SIZE_M * num_blocks_n
+    
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+
+        lora_idx, tile_m_idx, tile_n_idx = _compute_pid(
+            tile_id, num_pid_in_group, num_blocks_m, GROUP_SIZE_M, max_loras, num_tiles_per_lora,
+        )
+        lora_id = tl.load(lora_ids_ptr + lora_idx)
+        
+        if lora_id != -1:
+            
+            moe_enabled = tl.load(adapter_enabled + lora_id)
+            
+            if moe_enabled != 0:
+                
+                num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + lora_id)
+
+                m_start = tile_m_idx * BLOCK_SIZE_M
+                n_start = tile_n_idx * BLOCK_SIZE_N
+                splitk_start = tile_id % SPLIT_K
+
+                if m_start < num_tokens_post_padded:
+                    
+                    # offs_m = m_start + tl.arange(0, BLOCK_SIZE_M)
+                    # offs_n = n_start + tl.arange(0, BLOCK_SIZE_N)
+
+                    expert_index = lora_id * stride_el + tile_m_idx
+                    expert_id = tl.load(expert_ids_ptr + expert_index, expert_index < max_loras * stride_el, -1)
+                    
+                    if expert_id != -1:
+                        
+                        offs_token_id = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int32)
+                        token_index = stride_tl * lora_id + offs_token_id
+                        offs_m = tl.load(
+                            sorted_token_ids_ptr + token_index,
+                            mask=token_index < max_loras * stride_tl,
+                            other=num_valid_tokens,
+                        )
+
+                        offs_n = n_start + tl.arange(0, BLOCK_SIZE_N).to(tl.int32)
+                        offs_k = splitk_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
+                        slice_id = 0
+                        cur_b_ptr = tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
+                        b_ptrs = (
+                            cur_b_ptr
+                            + lora_id * stride_bl
+                            + expert_id * stride_be
+                            + offs_k[:, None] * stride_bk
+                            + offs_n[None, :] * stride_bn
+                        )
+
+                        a_ptrs = a_ptr + (
+                            offs_m[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+                        )
+
+                        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+                        for ki in range(num_tiles_k):
+
+                            offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
+                            # Create masks for bounds checking
+                            mask_m = offs_m < num_valid_tokens
+                            mask_n = offs_n < N
+                            mask_k = offs_k < K
+
+                            # masks for A and B
+                            mask_a = mask_m[:, None] & mask_k[None, :]
+                            mask_b = mask_n[None, :] & mask_k[:, None]
+
+                            if b_desc is not None:
+                                b = (
+                                    b_desc.load([lora_id, expert_id, n_start, ki * BLOCK_SIZE_K])
+                                    .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K).T
+                                )
+                            else:
+                                b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+                            a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+
+                            accumulator += tl.dot(a, b)
+                        
+                        tile_id_c += NUM_SMS
+                        _, tile_m_idx, tile_n_idx = _compute_pid(
+                            tile_id_c, num_pid_in_group, num_blocks_m, GROUP_SIZE_M, max_loras, num_tiles_per_lora,
+                        )
+
+                        # offs_m = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+                        offs_n = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+                        mask_m = offs_m < num_valid_tokens
+                        mask_n = offs_n < N
+                        mask_c = mask_m[:, None] & mask_n[None, :]
+
+                        c = accumulator.to(c_type)
+                        # Store output (C) with bounds checking
+                        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+                        tl.store(c_ptrs, c, mask=mask_c)
+
 
 @triton.jit(
     do_not_specialize=[
@@ -323,22 +487,17 @@ def _fused_moe_lora_shrink(
         "GROUP_SIZE_M": group_size_m,
         "num_warps": num_warps,
         "num_stages": num_stages,
-        "SPLIT_K": split_k,
-        "USE_GDC": use_gdc,
-        "launch_pdl": use_gdc,  # triton kernel metadata
-        "USE_TMA": use_tma,
+        "SPLIT_K": 1,
+        # "USE_GDC": use_gdc,
+        # "launch_pdl": use_gdc,  # triton kernel metadata
+        # "USE_TMA": use_tma,
     }
 
     b_ptr = _get_ptr(lora_a_stacked, device)
 
-    grid = lambda META: (
-        split_k
-        * triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        len(lora_a_stacked),
-        ## max_loras + 1 to handle the no-lora case (lora_id == -1)
-        lora_a_stacked[0].shape[0] + 1,
-    )
+    a_desc = b_desc = None
+    NUM_SMS = torch.cuda.get_device_properties(w1_lora_a_stacked.device).multi_processor_count
+    grid = lambda META: (META["NUM_SMS"], 1, 1)
 
     a_desc = b_desc = None
     if use_tma and num_slices == 1:
@@ -347,7 +506,7 @@ def _fused_moe_lora_shrink(
             [1, 1, shrink_config["BLOCK_SIZE_N"], shrink_config["BLOCK_SIZE_K"]],
         )
 
-    _fused_moe_lora_kernel[grid](
+    _fused_moe_lora_kernel_persistent[grid](
         qcurr_hidden_states,
         a_desc,
         b_ptr,
@@ -357,36 +516,80 @@ def _fused_moe_lora_shrink(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        N,
-        K,
-        EM,
-        num_tokens,
-        num_experts,
         lora_ids,
-        adapter_enabled,
-        lora_a_stacked[0].shape[0],
-        qcurr_hidden_states.stride(0),
-        qcurr_hidden_states.stride(1),
-        w1_lora_a_stacked.stride(0),
-        w1_lora_a_stacked.stride(1),
-        w1_lora_a_stacked.stride(3),
-        w1_lora_a_stacked.stride(2),
-        a_intermediate_cache1.stride(2),
-        a_intermediate_cache1.stride(3),
-        sorted_token_ids.stride(0),
-        expert_ids.stride(0),
-        slice_a_size=qcurr_hidden_states.numel(),
-        slice_c_size=a_intermediate_cache1.numel() // num_slices,
-        num_slice_a=1,
-        num_slice_c=num_slices,
-        top_k=1 if mul_routed_weight else top_k_num,
-        MUL_ROUTED_WEIGHT=False,
-        ADD_INPUTS=False,
-        USE_B_L2_CACHE=True,
-        sorted_c=use_tma,
-        IS_PRIMARY=True,
+        N=N,
+        K=K,
+        EM=EM,
+        stride_am=qcurr_hidden_states.stride(0),
+        stride_ak=qcurr_hidden_states.stride(1),
+        stride_el=expert_ids.stride(0),
+        stride_tl=sorted_token_ids.stride(0),
+        stride_bl=w1_lora_a_stacked.stride(0),
+        stride_be=w1_lora_a_stacked.stride(1),
+        stride_bk=w1_lora_a_stacked.stride(3),
+        stride_bn=w1_lora_a_stacked.stride(2),
+        stride_cm=a_intermediate_cache1.stride(2),
+        stride_cn=a_intermediate_cache1.stride(3),
+        num_valid_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k_num,
+        adapter_enabled=adapter_enabled,
+        max_loras=lora_a_stacked[0].shape[0],
+        NUM_SMS=NUM_SMS,
         **shrink_config,
     )
+    # grid = lambda META: (
+    #     split_k
+    #     * triton.cdiv(EM, META["BLOCK_SIZE_M"])
+    #     * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    #     len(lora_a_stacked),
+    #     ## max_loras + 1 to handle the no-lora case (lora_id == -1)
+    #     lora_a_stacked[0].shape[0] + 1,
+    # )
+
+    
+    
+
+    # _fused_moe_lora_kernel[grid](
+    #     qcurr_hidden_states,
+    #     a_desc,
+    #     b_ptr,
+    #     b_desc,
+    #     a_intermediate_cache1,
+    #     topk_weights,
+    #     sorted_token_ids,
+    #     expert_ids,
+    #     num_tokens_post_padded,
+    #     N,
+    #     K,
+    #     EM,
+    #     num_tokens,
+    #     num_experts,
+    #     lora_ids,
+    #     adapter_enabled,
+    #     lora_a_stacked[0].shape[0],
+    #     qcurr_hidden_states.stride(0),
+    #     qcurr_hidden_states.stride(1),
+    #     w1_lora_a_stacked.stride(0),
+    #     w1_lora_a_stacked.stride(1),
+    #     w1_lora_a_stacked.stride(3),
+    #     w1_lora_a_stacked.stride(2),
+    #     a_intermediate_cache1.stride(2),
+    #     a_intermediate_cache1.stride(3),
+    #     sorted_token_ids.stride(0),
+    #     expert_ids.stride(0),
+    #     slice_a_size=qcurr_hidden_states.numel(),
+    #     slice_c_size=a_intermediate_cache1.numel() // num_slices,
+    #     num_slice_a=1,
+    #     num_slice_c=num_slices,
+    #     top_k=1 if mul_routed_weight else top_k_num,
+    #     MUL_ROUTED_WEIGHT=False,
+    #     ADD_INPUTS=False,
+    #     USE_B_L2_CACHE=True,
+    #     sorted_c=use_tma,
+    #     IS_PRIMARY=True,
+    #     **shrink_config,
+    # )
 
 
 @torch.inference_mode()
