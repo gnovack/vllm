@@ -215,7 +215,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
                 expert_ids_lora = expert_ids_lora.view(self.max_loras, -1)
                 sorted_token_ids_lora = sorted_token_ids_lora.view(self.max_loras, -1)
-                #
+                
+                torch.cuda.nvtx.range_push("fused_moe_lora_w13")
 
                 self.punica_wrapper.add_lora_fused_moe(
                     input.view(-1, top_k, input.shape[-1]),
@@ -233,6 +234,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     self.adapter_enabled,
                     fully_sharded=self.fully_sharded,
                 )
+
+                torch.cuda.nvtx.range_pop()
 
                 result = func(*args, **kwargs)
 
@@ -280,6 +283,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
                 shard_size_w2 = divide(self.base_layer.hidden_size, self.tp_size)
 
+                torch.cuda.nvtx.range_push("fused_moe_lora_w2")
+
                 self.punica_wrapper.add_lora_fused_moe(
                     intermediate_cache3,
                     intermediate_cache2,
@@ -298,6 +303,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     fully_sharded=self.fully_sharded,
                     offset=shard_size_w2 * self.tp_rank if self.fully_sharded else 0,
                 )
+
+                torch.cuda.nvtx.range_pop()
 
                 result = func(*args, **kwargs)
                 return result

@@ -227,13 +227,13 @@ def get_lora_op_configs(
         "fused_moe_lora_w2_shrink",
     ]:
         default = {
-            "block_m": 64,
+            "block_m": 16,
             "block_n": min(64, next_power_of_2(rank)),
-            "block_k": 32,
+            "block_k": 64,
             "num_warps": 4,
-            "num_stages": 3,
-            "group_size_m": 8,
-            "split_k": 1,
+            "num_stages": 4,
+            "group_size_m": 1,
+            "split_k": 4,
         }
     elif op_type in [
         "fused_moe_lora_w13_expand",
