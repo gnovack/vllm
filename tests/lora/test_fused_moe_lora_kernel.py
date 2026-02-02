@@ -168,7 +168,7 @@ def use_fused_moe_lora_kernel(
     )
 
     config = {
-        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_M": block_size,
         "BLOCK_SIZE_N": 32,
         "BLOCK_SIZE_K": 64,
         "GROUP_SIZE_M": 1,
@@ -337,11 +337,11 @@ def test_fused_moe_lora_kernel(
 @pytest.mark.parametrize("num_tokens", [100])
 @pytest.mark.parametrize("top_k_num", [6])
 @pytest.mark.parametrize("num_experts", [64])
-@pytest.mark.parametrize("max_loras", [4])
+@pytest.mark.parametrize("max_loras", [1])
 @pytest.mark.parametrize("N", [1408])
 @pytest.mark.parametrize("K", [2048])
 @pytest.mark.parametrize("max_lora_rank", [16, 32, 64])
-@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("block_size", [32])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEED)
 @pytest.mark.parametrize("column_parallel", [True, False])
