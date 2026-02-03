@@ -69,67 +69,6 @@ def is_active_tile(lora_id, tile_m_start, adapter_enabled_ptr, num_tokens_post_p
     
     return False
 
-def fused_moe_lora_configs():
-    num_warps = [2,4,8]
-    num_stages = [3]
-    GROUP_SIZE_M = [1,16,32]
-
-    # return cartesian product of all possible configs
-    configs = []
-    for nw in num_warps:
-        for ns in num_stages:
-            for gsm in GROUP_SIZE_M:
-                configs.append(triton.Config({
-                    'GROUP_SIZE_M': gsm,
-                }, num_warps=nw, num_stages=ns))
-    return configs
-    
-def get_block_size_m(num_tokens):
-    return max(
-        16,
-        min(triton.next_power_of_2(num_tokens), 64)
-    )
-
-
-def maybe_init_tma_descriptors(nargs, reset_only=False):
-
-    BLOCK_N = nargs["BLOCK_SIZE_N"]
-    BLOCK_M = nargs["BLOCK_SIZE_M"]
-    BLOCK_K = nargs["BLOCK_SIZE_K"]
-
-    if nargs['USE_TMA']:
-        nargs['b_desc'].block_shape = [1, 1, BLOCK_N, BLOCK_K]
-
-        if nargs['CONTIGUOUS_A']:
-            nargs['a_desc'].block_shape = [BLOCK_M, BLOCK_K]
-
-
-def set_block_n(args):
-    block_n = max(min(256, triton.next_power_of_2(args['N'] // args['BLOCK_SIZE_M'])), 16)
-    args['b_desc'].block_shape[-2] = block_n
-    return block_n
-
-def set_block_k(args):
-    block_k = min(16, triton.next_power_of_2(args['K']))
-    args['b_desc'].block_shape[-1] = block_k
-    if args['CONTIGUOUS_A']:
-        args['a_desc'].block_shape[-1] = block_k
-    return block_k
-
-def set_num_sms(args):
-    return torch.cuda.get_device_properties(args['a_ptr'].device).multi_processor_count * 10
-
-@triton.autotune(
-    configs=fused_moe_lora_configs(),
-    key=["N", "K", "M_POWER"],
-    cache_results=True,
-)
-@triton.heuristics({
-    "BLOCK_SIZE_N": set_block_n,
-    "BLOCK_SIZE_K": set_block_k,
-    "SPLIT_K": lambda args: 1 if args['N'] > args['K'] else min(8, triton.next_power_of_2(int((args['K'] // args['N']) ** 0.5))),
-    "NUM_SMS": set_num_sms,
-})
 @triton.jit(
     do_not_specialize=[
         "num_valid_tokens",
@@ -165,7 +104,6 @@ def _fused_moe_lora_kernel_persistent(
     stride_tl,
     # Meta
     ADD_INPUTS: tl.constexpr,
-    CONTIGUOUS_A: tl.constexpr,
     MAX_LORAS: tl.constexpr,
     NUM_SMS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -176,7 +114,6 @@ def _fused_moe_lora_kernel_persistent(
     IS_PRIMARY: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     USE_TMA: tl.constexpr,
-    M_POWER: tl.constexpr,
     USE_GDC: tl.constexpr
 ):
     c_type = c_ptr.dtype.element_ty
@@ -291,16 +228,6 @@ def _fused_moe_lora_kernel_persistent(
                 else:
                     tl.store(c_ptrs, c, mask=mask_c)
 
-@triton.autotune(
-    configs=fused_moe_lora_configs(),
-    key=["N", "K", "M_POWER"],
-    cache_results=True,
-)
-@triton.heuristics({
-    "BLOCK_SIZE_N": set_block_n,
-    "BLOCK_SIZE_K": set_block_k,
-    "SPLIT_K": lambda args: 1 if args['N'] > args['K'] else min(8, triton.next_power_of_2(int((args['K'] // args['N']) ** 0.5))),
-})
 @triton.jit(
     do_not_specialize=[
         "num_valid_tokens",
@@ -363,8 +290,6 @@ def _fused_moe_lora_kernel(
     IS_PRIMARY: tl.constexpr,
     USE_TMA: tl.constexpr,
     sorted_c: tl.constexpr,
-    M_POWER: tl.constexpr,
-    CONTIGUOUS_A: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     slice_id = tl.program_id(axis=1)
@@ -577,11 +502,16 @@ def _fused_moe_lora_shrink(
 ) -> None:
     w1_lora_a_stacked = lora_a_stacked[0]
     shrink_config = {
-        "BLOCK_SIZE_M": get_block_size_m(num_tokens),
+        "BLOCK_SIZE_M": block_size_m,
+        "BLOCK_SIZE_N": block_size_n,
+        "BLOCK_SIZE_K": block_size_k,
+        "GROUP_SIZE_M": group_size_m,
+        "SPLIT_K": split_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
         "launch_pdl": use_gdc,
         "USE_GDC": use_gdc,
         "USE_TMA": use_tma,
-        "M_POWER": triton.next_power_of_2(num_tokens),
     }
 
     b_ptr = _get_ptr(lora_a_stacked, device)
@@ -589,27 +519,27 @@ def _fused_moe_lora_shrink(
     use_persistent = os.environ.get("VLLM_USE_PERSISTENT_KERNEL", "1") == "1"
 
     if use_persistent:
-        # NUM_SMS = torch.cuda.get_device_properties(w1_lora_a_stacked.device).multi_processor_count * 10
+        NUM_SMS = torch.cuda.get_device_properties(w1_lora_a_stacked.device).multi_processor_count * 10
         grid = lambda META: (META["NUM_SMS"], 1, 1)
 
         a_desc = b_desc = None
         if use_tma and num_slices == 1:
             b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
                 lora_a_stacked[0],
-                [1, 1, 16, 16],
+                [1, 1, block_size_n, block_size_k],
             )
 
         _fused_moe_lora_kernel_persistent[grid](
-            qcurr_hidden_states,
-            a_desc,
-            b_ptr,
-            b_desc,
-            a_intermediate_cache1,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            lora_ids,
+            a_ptr=qcurr_hidden_states,
+            a_desc=a_desc,
+            b_ptr=b_ptr,
+            b_desc=b_desc,
+            c_ptr=a_intermediate_cache1,
+            topk_weights_ptr=topk_weights,
+            sorted_token_ids_ptr=sorted_token_ids,
+            expert_ids_ptr=expert_ids,
+            num_tokens_post_padded_ptr=num_tokens_post_padded,
+            lora_ids_ptr=lora_ids,
             N=N,
             K=K,
             EM=EM,
@@ -631,7 +561,7 @@ def _fused_moe_lora_shrink(
             ADD_INPUTS=False,
             IS_PRIMARY=True,
             MUL_ROUTED_WEIGHT=False,
-            CONTIGUOUS_A=False,
+            NUM_SMS=NUM_SMS,
             **shrink_config,
         )
     else:
@@ -647,37 +577,37 @@ def _fused_moe_lora_shrink(
         if use_tma and num_slices == 1:
             b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
                 lora_a_stacked[0],
-                [1, 1, 16, 16],
+                [1, 1, block_size_n, block_size_k],
             )
 
         _fused_moe_lora_kernel[grid](
-            qcurr_hidden_states,
-            a_desc,
-            b_ptr,
-            b_desc,
-            a_intermediate_cache1,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            N,
-            K,
-            EM,
-            num_tokens,
-            num_experts,
-            lora_ids,
-            adapter_enabled,
-            lora_a_stacked[0].shape[0],
-            qcurr_hidden_states.stride(0),
-            qcurr_hidden_states.stride(1),
-            w1_lora_a_stacked.stride(0),
-            w1_lora_a_stacked.stride(1),
-            w1_lora_a_stacked.stride(3),
-            w1_lora_a_stacked.stride(2),
-            a_intermediate_cache1.stride(2),
-            a_intermediate_cache1.stride(3),
-            sorted_token_ids.stride(0),
-            expert_ids.stride(0),
+            a_ptr=qcurr_hidden_states,
+            a_desc=a_desc,
+            b_ptr=b_ptr,
+            b_desc=b_desc,
+            c_ptr=a_intermediate_cache1,
+            topk_weights_ptr=topk_weights,
+            sorted_token_ids_ptr=sorted_token_ids,
+            expert_ids_ptr=expert_ids,
+            num_tokens_post_padded_ptr=num_tokens_post_padded,
+            N=N,
+            K=K,
+            EM=EM,
+            num_valid_tokens=num_tokens,
+            num_experts=num_experts,
+            lora_ids=lora_ids,
+            adapter_enabled=adapter_enabled,
+            max_loras=lora_a_stacked[0].shape[0],
+            stride_am=qcurr_hidden_states.stride(0),
+            stride_ak=qcurr_hidden_states.stride(1),
+            stride_bl=w1_lora_a_stacked.stride(0),
+            stride_be=w1_lora_a_stacked.stride(1),
+            stride_bk=w1_lora_a_stacked.stride(3),
+            stride_bn=w1_lora_a_stacked.stride(2),
+            stride_cm=a_intermediate_cache1.stride(2),
+            stride_cn=a_intermediate_cache1.stride(3),
+            stride_tl=sorted_token_ids.stride(0),
+            stride_el=expert_ids.stride(0),
             slice_a_size=qcurr_hidden_states.numel(),
             slice_c_size=a_intermediate_cache1.numel() // num_slices,
             num_slice_a=1,
@@ -688,7 +618,6 @@ def _fused_moe_lora_shrink(
             USE_B_L2_CACHE=True,
             sorted_c=use_tma,
             IS_PRIMARY=True,
-            CONTIGUOUS_A=False,
             **shrink_config,
         )
 
@@ -741,11 +670,16 @@ def _fused_moe_lora_expand(
     )
 
     expand_config = {
+        "BLOCK_SIZE_M": block_size_m,
+        "BLOCK_SIZE_N": block_size_n,
+        "BLOCK_SIZE_K": block_size_k,
+        "GROUP_SIZE_M": group_size_m,
+        "SPLIT_K": 1,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "launch_pdl": use_gdc,
         "USE_GDC": use_gdc,
-        "BLOCK_SIZE_M": get_block_size_m(num_tokens),
-        "launch_pdl": use_gdc,  # triton kernel metadata
         "USE_TMA": use_tma,
-        "M_POWER": triton.next_power_of_2(num_tokens),
     }
 
     use_persistent = os.environ.get("VLLM_USE_PERSISTENT_KERNEL", "1") == "1"
@@ -754,7 +688,7 @@ def _fused_moe_lora_expand(
     slice_c_size = N * out_view.stride(2)
 
     if use_persistent:
-        # NUM_SMS = torch.cuda.get_device_properties(w1_lora_b_stacked.device).multi_processor_count * 10
+        NUM_SMS = torch.cuda.get_device_properties(w1_lora_b_stacked.device).multi_processor_count * 10
         grid = lambda META: (META["NUM_SMS"], 1, 1)
 
         a_desc = None
@@ -762,27 +696,27 @@ def _fused_moe_lora_expand(
         if use_tma:
             a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
                 a_intermediate_cache1,
-                [get_block_size_m(num_tokens), 16],
+                [block_size_m, block_size_k],
             )
             if num_slices == 1:
                 b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
                     lora_b_stacked[0],
-                    [1, 1, 16, 16],
+                    [1, 1, block_size_n, block_size_k],
                 )
         else:
             b_desc = None
         
         _fused_moe_lora_kernel_persistent[grid](
-            a_intermediate_cache1,
-            a_desc,
-            b_ptr,
-            b_desc,
-            out_view,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            lora_ids,
+            a_ptr=a_intermediate_cache1,
+            a_desc=a_desc,
+            b_ptr=b_ptr,
+            b_desc=b_desc,
+            c_ptr=out_view,
+            topk_weights_ptr=topk_weights,
+            sorted_token_ids_ptr=sorted_token_ids,
+            expert_ids_ptr=expert_ids,
+            num_tokens_post_padded_ptr=num_tokens_post_padded,
+            lora_ids_ptr=lora_ids,
             N=N,
             K=K,
             EM=EM,
@@ -804,7 +738,7 @@ def _fused_moe_lora_expand(
             ADD_INPUTS=True,
             IS_PRIMARY=False,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
-            CONTIGUOUS_A=use_tma,
+            NUM_SMS=NUM_SMS,
             **expand_config,
         )
     else:
@@ -818,44 +752,44 @@ def _fused_moe_lora_expand(
         if use_tma:
             a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
                 a_intermediate_cache1,
-                [expand_config["BLOCK_SIZE_M"], 16],
+                [expand_config["BLOCK_SIZE_M"], block_size_k],
             )
             if num_slices == 1:
                 b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
                     lora_b_stacked[0],
-                    [1, 1, 16, 16],
+                    [1, 1, block_size_n, block_size_k],
                 )
         else:
             b_desc = None
 
         _fused_moe_lora_kernel[grid](
-            a_intermediate_cache1,
-            a_desc,
-            b_ptr,
-            b_desc,
-            out_view,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            N,
-            K,
-            EM,
-            num_tokens,
-            num_experts,
-            lora_ids,
-            adapter_enabled,
-            lora_b_stacked[0].shape[0],
-            a_intermediate_cache1.stride(0),
-            a_intermediate_cache1.stride(1),
-            w1_lora_b_stacked.stride(0),
-            w1_lora_b_stacked.stride(1),
-            w1_lora_b_stacked.stride(3),
-            w1_lora_b_stacked.stride(2),
-            out_view.stride(1),
-            out_view.stride(2),
-            sorted_token_ids.stride(0),
-            expert_ids.stride(0),
+            a_ptr=a_intermediate_cache1,
+            a_desc=a_desc,
+            b_ptr=b_ptr,
+            b_desc=b_desc,
+            c_ptr=out_view,
+            topk_weights_ptr=topk_weights,
+            sorted_token_ids_ptr=sorted_token_ids,
+            expert_ids_ptr=expert_ids,
+            num_tokens_post_padded_ptr=num_tokens_post_padded,
+            N=N,
+            K=K,
+            EM=EM,
+            num_valid_tokens=num_tokens,
+            num_experts=num_experts,
+            lora_ids=lora_ids,
+            adapter_enabled=adapter_enabled,
+            max_loras=lora_b_stacked[0].shape[0],
+            stride_am=a_intermediate_cache1.stride(0),
+            stride_ak=a_intermediate_cache1.stride(1),
+            stride_bl=w1_lora_b_stacked.stride(0),
+            stride_be=w1_lora_b_stacked.stride(1),
+            stride_bk=w1_lora_b_stacked.stride(3),
+            stride_bn=w1_lora_b_stacked.stride(2),
+            stride_cm=out_view.stride(1),
+            stride_cn=out_view.stride(2),
+            stride_tl=sorted_token_ids.stride(0),
+            stride_el=expert_ids.stride(0),
             slice_a_size=a_intermediate_cache1.numel() // num_slices,
             slice_c_size=slice_c_size,
             num_slice_a=num_slices,
@@ -866,7 +800,6 @@ def _fused_moe_lora_expand(
             USE_B_L2_CACHE=True,
             sorted_c=False,
             IS_PRIMARY=False,
-            CONTIGUOUS_A=use_tma,
             **expand_config,
         )
     
