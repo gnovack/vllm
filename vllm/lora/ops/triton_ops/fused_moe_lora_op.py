@@ -69,6 +69,31 @@ def is_active_tile(lora_id, tile_m_start, adapter_enabled_ptr, num_tokens_post_p
     
     return False
 
+@triton.jit
+def _get_tile_details(tile_id, num_pid_in_group, num_pid_m, group_size_m, num_tiles_per_lora, lora_ids_ptr, adapter_enabled_ptr, num_tokens_post_padded_ptr, BLOCK_SIZE_M):
+    lora_idx = tile_id // num_tiles_per_lora
+    lora_id = tl.load(lora_ids_ptr + lora_idx)
+    lora_tile_id = tile_id % num_tiles_per_lora
+    if lora_id == -1:
+        return -1, -1, -1, -1, False
+    
+    moe_enabled = tl.load(adapter_enabled_ptr + lora_id)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + lora_id)
+    if moe_enabled == 0:
+        return -1, -1, -1, -1, False
+    
+    group_id = lora_tile_id // num_pid_in_group
+    first_pid_m = group_id * group_size_m
+    trimmed_group_size_m = min(num_pid_m - first_pid_m, group_size_m)
+    pid_m = first_pid_m + (lora_tile_id % trimmed_group_size_m)
+    m_start = pid_m * BLOCK_SIZE_M
+    if m_start < num_tokens_post_padded:
+        return -1, -1, -1, -1, False
+
+    pid_n = (lora_tile_id % num_pid_in_group) // trimmed_group_size_m
+    return lora_id, pid_m, pid_n, m_start, True
+
+
 @triton.jit(
     do_not_specialize=[
         "num_valid_tokens",
@@ -114,15 +139,26 @@ def _fused_moe_lora_kernel_persistent(
     IS_PRIMARY: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     USE_TMA: tl.constexpr,
-    USE_GDC: tl.constexpr
+    USE_GDC: tl.constexpr,
+    NUM_BLOCKS_M: tl.constexpr,
+    NUM_BLOCKS_N: tl.constexpr,
+    NUM_TILE_K: tl.constexpr,
+    NUM_TILES_PER_LORA: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    MAX_EXPERT_INDEX: tl.constexpr,
 ):
     c_type = c_ptr.dtype.element_ty
     tile_id = tl.program_id(axis=0)
-    num_blocks_m = tl.cdiv(EM, BLOCK_SIZE_M)
-    num_blocks_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_tiles_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
-    num_tiles_per_lora = num_blocks_m * num_blocks_n
-    num_tiles = MAX_LORAS * num_tiles_per_lora
+    num_blocks_m = NUM_BLOCKS_M
+    num_blocks_n = NUM_BLOCKS_N
+    num_tiles_k = NUM_TILE_K
+    # num_blocks_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    # num_blocks_n = tl.cdiv(N, BLOCK_SIZE_N)
+    # num_tiles_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
+    # num_tiles_per_lora = num_blocks_m * num_blocks_n
+    num_tiles_per_lora = NUM_TILES_PER_LORA
+    num_tiles = NUM_TILES
+    # num_tiles = MAX_LORAS * num_tiles_per_lora
     num_pid_in_group = GROUP_SIZE_M * num_blocks_n
 
     m_block = tl.arange(0, BLOCK_SIZE_M)
@@ -131,19 +167,16 @@ def _fused_moe_lora_kernel_persistent(
 
     for tile_id in tl.range(tile_id, num_tiles, NUM_SMS):
 
-        lora_idx, tile_m_idx, tile_n_idx = _compute_pid(
-            tile_id // SPLIT_K, num_pid_in_group, num_blocks_m, GROUP_SIZE_M, num_tiles_per_lora,
+        lora_id, tile_m_idx, tile_n_idx, m_start, is_active = _get_tile_details(
+            tile_id // SPLIT_K, num_pid_in_group, num_blocks_m, GROUP_SIZE_M, num_tiles_per_lora, lora_ids_ptr, adapter_enabled, num_tokens_post_padded_ptr, BLOCK_SIZE_M
         )
-        lora_id = tl.load(lora_ids_ptr + lora_idx)
         
-        m_start = tile_m_idx * BLOCK_SIZE_M
-        n_start = tile_n_idx * BLOCK_SIZE_N
-        k_start = (tile_id % SPLIT_K) * BLOCK_SIZE_K
-        
-        if is_active_tile(lora_id, m_start, adapter_enabled, num_tokens_post_padded_ptr):
-
+        if is_active:
+            n_start = tile_n_idx * BLOCK_SIZE_N
+            k_start = (tile_id % SPLIT_K) * BLOCK_SIZE_K
             expert_index = lora_id * stride_el + tile_m_idx
-            expert_id = tl.load(expert_ids_ptr + expert_index, expert_index < MAX_LORAS * stride_el, -1)
+            expert_id = tl.load(expert_ids_ptr + expert_index, expert_index < MAX_EXPERT_INDEX, -1)
+
             
             if expert_id != -1:
                 
@@ -224,7 +257,8 @@ def _fused_moe_lora_kernel_persistent(
                 c = accumulator.to(c_type)
                 mask_c = mask_m[:, None] & mask_n[None, :]
                 if SPLIT_K > 1 or ADD_INPUTS:
-                    tl.atomic_add(c_ptrs, c, mask=mask_c, sem="relaxed")
+                    # tl.atomic_add(c_ptrs, c, mask=mask_c, sem="relaxed")
+                    tl.store(c_ptrs, c, mask=mask_c)
                 else:
                     tl.store(c_ptrs, c, mask=mask_c)
 
@@ -529,6 +563,7 @@ def _fused_moe_lora_shrink(
                 [1, 1, block_size_n, block_size_k],
             )
 
+        num_tiles_per_lora = triton.cdiv(EM, block_size_m) * triton.cdiv(N, block_size_n)
         _fused_moe_lora_kernel_persistent[grid](
             a_ptr=qcurr_hidden_states,
             a_desc=a_desc,
@@ -562,6 +597,12 @@ def _fused_moe_lora_shrink(
             IS_PRIMARY=True,
             MUL_ROUTED_WEIGHT=False,
             NUM_SMS=NUM_SMS,
+            NUM_BLOCKS_M=triton.cdiv(EM, block_size_m),
+            NUM_BLOCKS_N=triton.cdiv(N, block_size_n),
+            NUM_TILE_K=triton.cdiv(K, block_size_k * split_k),
+            NUM_TILES_PER_LORA=num_tiles_per_lora,
+            NUM_TILES=num_tiles_per_lora * lora_a_stacked[0].shape[0],
+            MAX_EXPERT_INDEX=lora_a_stacked[0].shape[0]*expert_ids.stride(0),
             **shrink_config,
         )
     else:
@@ -688,7 +729,7 @@ def _fused_moe_lora_expand(
     slice_c_size = N * out_view.stride(2)
 
     if use_persistent:
-        NUM_SMS = torch.cuda.get_device_properties(w1_lora_b_stacked.device).multi_processor_count * 10
+        NUM_SMS = torch.cuda.get_device_properties(w1_lora_b_stacked.device).multi_processor_count * 16
         grid = lambda META: (META["NUM_SMS"], 1, 1)
 
         a_desc = None
@@ -706,6 +747,7 @@ def _fused_moe_lora_expand(
         else:
             b_desc = None
         
+        num_tiles_per_lora = triton.cdiv(EM, block_size_m) * triton.cdiv(N, block_size_n)
         _fused_moe_lora_kernel_persistent[grid](
             a_ptr=a_intermediate_cache1,
             a_desc=a_desc,
@@ -739,6 +781,12 @@ def _fused_moe_lora_expand(
             IS_PRIMARY=False,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             NUM_SMS=NUM_SMS,
+            NUM_BLOCKS_M=triton.cdiv(EM, block_size_m),
+            NUM_BLOCKS_N=triton.cdiv(N, block_size_n),
+            NUM_TILE_K=triton.cdiv(K, block_size_k * split_k),
+            NUM_TILES_PER_LORA=num_tiles_per_lora,
+            NUM_TILES=num_tiles_per_lora * lora_b_stacked[0].shape[0],
+            MAX_EXPERT_INDEX=lora_b_stacked[0].shape[0]*expert_ids.stride(0),
             **expand_config,
         )
     else:
@@ -882,7 +930,8 @@ def _fused_moe_lora(
         device=device,
     )
 
-    use_gdc = supports_pdl(device) and not fully_sharded
+    # use_gdc = supports_pdl(device) and not fully_sharded
+    use_gdc = False
     torch.cuda.nvtx.range_push("fused_moe_lora_shrink")
     _fused_moe_lora_shrink(
         a_intermediate_cache1,

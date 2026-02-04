@@ -3472,7 +3472,7 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        torch.cuda.cudart().cudaProfilerStart()
+        # torch.cuda.cudart().cudaProfilerStart()
 
         with (
             set_forward_context(
@@ -3496,7 +3496,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
-        torch.cuda.cudart().cudaProfilerStop()
+        # torch.cuda.cudart().cudaProfilerStop()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

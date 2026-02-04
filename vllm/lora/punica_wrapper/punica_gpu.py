@@ -403,7 +403,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             shrink_config.get("GROUP_SIZE_M", 8),
             shrink_config.get("NUM_WARPS", 4),
             shrink_config.get("NUM_STAGES", 3),
-            shrink_config.get("SPLIT_K", 1),
+            shrink_config.get("SPLIT_K", 8), # TODO(gnovack)
             expand_config.get("BLOCK_SIZE_M", 64),
             expand_config.get("BLOCK_SIZE_N", 64),
             expand_config.get("BLOCK_SIZE_K", 32),
