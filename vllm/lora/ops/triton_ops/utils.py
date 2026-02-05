@@ -4,6 +4,7 @@
 import functools
 import json
 from functools import lru_cache
+import os
 from pathlib import Path
 from typing import Any
 
@@ -152,6 +153,7 @@ def _get_lora_b_ptr(
 
 @functools.lru_cache
 def load_lora_op_config(op_type: str, add_inputs: bool | None) -> dict | None:
+    # user_defined_config_folder = os.environ['VLLM_TUNED_CONFIG_FOLDER']
     user_defined_config_folder = envs.VLLM_TUNED_CONFIG_FOLDER
     # Avoid optimizing for the batch invariant case. Use default config
     if user_defined_config_folder is not None and not is_batch_invariant:
@@ -174,7 +176,8 @@ def load_lora_op_config(op_type: str, add_inputs: bool | None) -> dict | None:
             return None
 
         # Load json
-        logger.info_once(f"Using tuned LoRA kernel configs from {config_path}.")
+        # logger.info_once(f"Using tuned LoRA kernel configs from {config_path}.")
+        logger.info(f"Using tuned LoRA kernel configs from {config_path}.")
         with open(str(config_path)) as f:
             config_data = json.load(f)
     else:
@@ -227,13 +230,13 @@ def get_lora_op_configs(
         "fused_moe_lora_w2_shrink",
     ]:
         default = {
-            "block_m": 16,
+            "block_m": 64,
             "block_n": min(64, next_power_of_2(rank)),
-            "block_k": 64,
+            "block_k": 32,
             "num_warps": 4,
-            "num_stages": 4,
-            "group_size_m": 1,
-            "split_k": 4,
+            "num_stages": 3,
+            "group_size_m": 8,
+            "split_k": 1,
         }
     elif op_type in [
         "fused_moe_lora_w13_expand",

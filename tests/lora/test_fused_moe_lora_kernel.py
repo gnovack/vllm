@@ -240,9 +240,9 @@ DEVICES = [f"cuda:{0}"]
 SEED = [42]
 
 
-@pytest.mark.parametrize("num_tokens", [16])
+@pytest.mark.parametrize("num_tokens", [16,64])
 @pytest.mark.parametrize("top_k_num", [4])
-@pytest.mark.parametrize("num_experts", [4])
+@pytest.mark.parametrize("num_experts", [128])
 @pytest.mark.parametrize("max_loras", [4])
 @pytest.mark.parametrize("N", [1408])
 @pytest.mark.parametrize("K", [2048])
