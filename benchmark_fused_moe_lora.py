@@ -148,22 +148,22 @@ def benchmark_kernel(num_tokens, top_k_num, num_experts, max_loras, N, K,
 @triton.testing.perf_report(
 triton.testing.Benchmark(
     x_names=['num_tokens'],  # Argument names to use as an x-axis for the plot.
-    x_vals=[1,2,4,8,16,32,64,128,256,1024,8192],  # Different possible values for `x_name`.
-    # x_vals=[1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192],  # Different possible values for `x_name`.
+    # x_vals=[1,2,4,8,16,32,64,128,256,512,1024,2048],  # Different possible values for `x_name`.
+    x_vals=[1,2,4,8,16,32,64,128,256,512,1024,8192],  # Different possible values for `x_name`.
     line_arg='kernel',  # Argument name whose value corresponds to a different line in the plot.
-    # line_vals=['base'],  # Possible values for `line_arg`.
-    # line_names=['No TMA'],  # Label name for the lines.
-    line_vals=['base', 'persistent'],  # Possible values for `line_arg`.
-    line_names=['Base', 'Persistent'],  # Label name for the lines.
+    # line_vals=['untuned'],  # Possible values for `line_arg`.
+    # line_names=['Untuned'],  # Label name for the lines.
+    line_vals=['untuned', 'base'],  # Possible values for `line_arg`.
+    line_names=['Untuned', 'Base'],  # Label name for the lines.
     styles=[('blue', '-'), ('green', '-'), ('red', '-'), ('yellow', '-')],  # Line styles.
     ylabel='us',  # Label name for the y-axis.
     plot_name='fused-moe-lora-performance',  # Name for the plot. Used also as a file name for saving the plot.
     args={
         "top_k_num": 8,
         "num_experts": 128,
-        "max_loras": 32,
-        "N": 2048,
-        "K": 768,
+        "max_loras": 8,
+        "N": 768,
+        "K": 2048,
         "max_lora_rank": 32,
         "dtype": torch.bfloat16,
         "device": "cuda:0",
@@ -182,18 +182,22 @@ def triton_bench_kernel(num_tokens, top_k_num, num_experts, max_loras, N, K,  ma
     elif kernel == 'tma':
         os.environ['VLLM_USE_PERSISTENT_KERNEL'] = '0'
         os.environ['DISABLE_TMA'] = '0'
-        os.environ['VLLM_TUNED_CONFIG_FOLDER'] = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/gpt-oss-120b-persistent'
-        envs.VLLM_TUNED_CONFIG_FOLDER = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/gpt-oss-120b-persistent'
+        os.environ['VLLM_TUNED_CONFIG_FOLDER'] = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/gpt-oss-120b'
+        envs.VLLM_TUNED_CONFIG_FOLDER = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/gpt-oss-120b'
+        # os.environ['VLLM_TUNED_CONFIG_FOLDER'] = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/gpt-oss-120b-persistent'
+        # envs.VLLM_TUNED_CONFIG_FOLDER = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/gpt-oss-120b-persistent'
     elif kernel == 'base':
         os.environ['VLLM_USE_PERSISTENT_KERNEL'] = '0'
         os.environ['DISABLE_TMA'] = '1'
         # os.environ['VLLM_TUNED_CONFIG_FOLDER'] = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/gpt-oss-120b-old'
-        os.environ['VLLM_TUNED_CONFIG_FOLDER'] = '/root/workspace/gnovack/lora-profiling/vllm/vllm/lora/ops/triton_ops/qwen3-coder-30B-A3B'
         # envs.VLLM_TUNED_CONFIG_FOLDER = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/gpt-oss-120b-old'
-        envs.VLLM_TUNED_CONFIG_FOLDER = '/root/workspace/gnovack/lora-profiling/vllm/vllm/lora/ops/triton_ops/qwen3-coder-30B-A3B'
+        os.environ['VLLM_TUNED_CONFIG_FOLDER'] = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/new-coder'
+        envs.VLLM_TUNED_CONFIG_FOLDER = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/new-coder'
     elif kernel == 'untuned':
         os.environ['VLLM_USE_PERSISTENT_KERNEL'] = '0'
         os.environ['DISABLE_TMA'] = '1'
+        os.environ['VLLM_TUNED_CONFIG_FOLDER'] = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/fake'
+        envs.VLLM_TUNED_CONFIG_FOLDER = '/root/workspace/gnovack/lora-profiling/kernel-tuner/configs/fake'
 
 
     torch.set_default_device(device)
@@ -222,7 +226,7 @@ def triton_bench_kernel(num_tokens, top_k_num, num_experts, max_loras, N, K,  ma
     block_size = shrink_config["BLOCK_SIZE_M"]
     
     # Generate data
-    num_sequences = 1
+    num_sequences = 4
     topk_ids, topk_weights = assign_experts_to_tokens(num_tokens, num_experts, top_k_num)
     token_lora_mapping = assign_loras_to_tokens(num_tokens, num_sequences, max_loras)
     
@@ -243,6 +247,9 @@ def triton_bench_kernel(num_tokens, top_k_num, num_experts, max_loras, N, K,  ma
     num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32)
     adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32)
     lora_ids = torch.arange(max_loras + 2, dtype=torch.int32)
+
+    print("shrink_config", shrink_config)
+    print("expand_config", expand_config)
     
     ops.moe_lora_align_block_size(
         topk_ids, token_lora_mapping, num_experts, block_size, max_loras,
@@ -253,15 +260,19 @@ def triton_bench_kernel(num_tokens, top_k_num, num_experts, max_loras, N, K,  ma
     expert_ids = expert_ids.view(max_loras, -1)
     sorted_token_ids = sorted_token_ids.view(max_loras, -1)
 
+    # shrink_config {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 256, 'num_warps': 4, 'num_stages': 3, 'GROUP_SIZE_M': 64, 'SPLIT_K': 8}
+    # expand_config {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'num_warps': 4, 'num_stages': 3, 'GROUP_SIZE_M': 64}
+
+
     bench_fn = lambda: fused_moe_lora(output, hidden_states, lora_a_stacked, lora_b_stacked, topk_weights,
         sorted_token_ids, expert_ids, num_tokens_post_padded, max_lora_rank,
         top_k_num, lora_ids, adapter_enabled, shrink_config["BLOCK_SIZE_M"],
         shrink_config["BLOCK_SIZE_N"], shrink_config["BLOCK_SIZE_K"], shrink_config["GROUP_SIZE_M"],
-        shrink_config["num_warps"], shrink_config["num_stages"], shrink_config.get("SPLIT_K", 8),
+        shrink_config["num_warps"], shrink_config["num_stages"], shrink_config.get("split_k", 1),
         expand_config["BLOCK_SIZE_M"], expand_config["BLOCK_SIZE_N"], expand_config["BLOCK_SIZE_K"],
         expand_config["GROUP_SIZE_M"], expand_config["num_warps"], expand_config["num_stages"],
-        expand_config.get("SPLIT_K", 1), False, fully_sharded=False, offset=0)
-    ms = triton.testing.do_bench_cudagraph(bench_fn, rep=50)
+        expand_config.get("split_k", 1), False, fully_sharded=False, offset=0)
+    ms = triton.testing.do_bench_cudagraph(bench_fn, rep=50, return_mode='median')
     return ms * 1000
 
 

@@ -4,6 +4,7 @@
 import functools
 import json
 from functools import lru_cache
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -230,32 +231,32 @@ def get_lora_op_configs(
         "fused_moe_lora_w2_shrink",
     ]:
         default = {
-            "block_m": 64,
-            "block_n": min(64, next_power_of_2(rank)),
-            "block_k": 32,
+            "BLOCK_SIZE_M": max(16, min(64, next_power_of_2(int(math.sqrt(batch // 2))))),
+            "BLOCK_SIZE_N": min(64, next_power_of_2(rank)),
+            "BLOCK_SIZE_K": 128,
             "num_warps": 4,
             "num_stages": 3,
-            "group_size_m": 8,
-            "split_k": 1,
+            "GROUP_SIZE_M": 8,
+            "SPLIT_K": 8,
         }
     elif op_type in [
         "fused_moe_lora_w13_expand",
         "fused_moe_lora_w2_expand",
     ]:
         default = {
-            "block_m": 64,
-            "block_n": 64,
-            "block_k": max(16, min(32, next_power_of_2(rank))),
+            "BLOCK_SIZE_M": max(16, min(64, next_power_of_2(int(math.sqrt(batch // 2))))),
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": max(16, min(32, next_power_of_2(rank))),
             "num_warps": 4,
             "num_stages": 3,
-            "group_size_m": 8,
-            "split_k": 1,
+            "GROUP_SIZE_M": 8,
+            "SPLIT_K": 1,
         }
     else:
         default = {
-            "block_m": 64,
-            "block_n": max(64, next_power_of_2(128 // num_slices)),
-            "block_k": 16,
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": max(64, next_power_of_2(128 // num_slices)),
+            "BLOCK_SIZE_K": 16,
             "num_warps": 4,
             "num_ctas": 1,
             "num_stages": 2,

@@ -109,6 +109,11 @@ def _get_tile_details(tile_id, num_pid_in_group, num_pid_m, group_size_m, num_ti
         "EM",
         "stride_tl",
         "stride_el",
+        "NUM_BLOCKS_M",
+        "NUM_TILES_PER_LORA",
+        "MAX_EXPERT_INDEX",
+        "SLICE_A_SIZE",
+        "MAX_TOKEN_IDX",
     ]
 )
 def _fused_moe_lora_kernel_persistent(
@@ -138,6 +143,12 @@ def _fused_moe_lora_kernel_persistent(
     stride_tl,
     # slice size
     slice_c_size,
+    # non-const meta
+    NUM_BLOCKS_M,
+    NUM_TILES_PER_LORA,
+    MAX_EXPERT_INDEX,
+    SLICE_A_SIZE,
+    MAX_TOKEN_IDX,
     # Meta
     ADD_INPUTS: tl.constexpr,
     MAX_LORAS: tl.constexpr,
@@ -151,14 +162,9 @@ def _fused_moe_lora_kernel_persistent(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     USE_TMA: tl.constexpr,
     USE_GDC: tl.constexpr,
-    NUM_BLOCKS_M: tl.constexpr,
     NUM_BLOCKS_N: tl.constexpr,
     NUM_TILE_K: tl.constexpr,
-    NUM_TILES_PER_LORA: tl.constexpr,
     NUM_TILES: tl.constexpr,
-    MAX_EXPERT_INDEX: tl.constexpr,
-    SLICE_A_SIZE: tl.constexpr,
-    MAX_TOKEN_IDX: tl.constexpr,
     NUM_SLICES: tl.constexpr,
     NUM_TILES_PER_SLICE: tl.constexpr,
 ):
@@ -167,7 +173,7 @@ def _fused_moe_lora_kernel_persistent(
     pid = tl.program_id(axis=0)
     slice_id = pid // (NUM_SMS // NUM_SLICES)
 
-    if slice_id > 0:
+    if NUM_SLICES > 1 and slice_id > 0:
         cur_b_ptr = tl.load(b_ptr + slice_id).to(
             tl.pointer_type(c_ptr.dtype.element_ty)
         )
@@ -959,6 +965,8 @@ def _fused_moe_lora(
         # if num_slices > 1, we construct TMA descriptors for
         # LoRA weights within the kernel, which requires us to first set an allocator
         _set_triton_allocator(device)
+        
+    # _set_triton_allocator(device)
 
     a_intermediate_cache1 = torch.zeros(
         (num_slices, triton.cdiv(EM, top_k_num), top_k_num, max_lora_rank),
