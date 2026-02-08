@@ -7,6 +7,7 @@
 
 import vllm
 from vllm.lora.request import LoRARequest
+import pytest
 
 from ..utils import multi_gpu_test
 
@@ -64,21 +65,24 @@ def generate_and_test(llm: vllm.LLM, lora_path: str, lora_id: int) -> None:
         assert generated_texts[i].startswith(EXPECTED_LORA_OUTPUT[i])
 
 
-def test_qwen3moe_lora(qwen3moe_lora_files):
+def test_qwen3moe_lora(monkeypatch: pytest.MonkeyPatch, qwen3moe_lora_files):
     # We enable enforce_eager=True here to reduce VRAM usage for lora-test CI,
     # Otherwise, the lora-test will fail due to CUDA OOM.
-    llm = vllm.LLM(
-        MODEL_PATH,
-        max_model_len=1024,
-        enable_lora=True,
-        max_loras=4,
-        enforce_eager=True,
-        trust_remote_code=True,
-        enable_chunked_prefill=True,
-    )
+    with monkeypatch.context() as m:
+        m.setenv("USE_TMA", "1")
+        m.setenv("USE_PERSISTENT", "1")
+        llm = vllm.LLM(
+            MODEL_PATH,
+            max_model_len=1024,
+            enable_lora=True,
+            max_loras=4,
+            enforce_eager=True,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+        )
 
-    generate_and_test(llm, qwen3moe_lora_files, lora_id=1)
-    generate_and_test(llm, qwen3moe_lora_files, lora_id=2)
+        generate_and_test(llm, qwen3moe_lora_files, lora_id=1)
+        generate_and_test(llm, qwen3moe_lora_files, lora_id=2)
 
 
 @multi_gpu_test(num_gpus=2)
