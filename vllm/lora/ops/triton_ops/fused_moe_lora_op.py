@@ -28,7 +28,7 @@ def _get_tile_details(tile_id, num_pid_in_group, num_pid_m, group_size_m, num_ti
     lora_idx = tile_id // num_tiles_per_lora
     lora_id = tl.load(lora_ids_ptr + lora_idx)
     if lora_id == -1 or lora_id >= MAX_LORAS:
-        return -1, -1, -1, -1, -1, False
+        return -1, -1, -1, -1, False
 
     lora_tile_id = tile_id % num_tiles_per_lora
     group_id = lora_tile_id // num_pid_in_group
@@ -42,16 +42,16 @@ def _get_tile_details(tile_id, num_pid_in_group, num_pid_m, group_size_m, num_ti
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + lora_id)
     expert_id = tl.load(expert_ids_ptr + expert_index, expert_index < MAX_EXPERT_INDEX, -1)
     if moe_enabled == 0:
-        return -1, -1, -1, -1, -1, False
+        return -1, -1, -1, -1, False
     
     if m_start >= num_tokens_post_padded:
-        return -1, -1, -1, -1, -1, False
+        return -1, -1, -1, -1, False
 
     if expert_id == -1:
-        return -1, -1, -1, -1, -1, False
+        return -1, -1, -1, -1, False
 
     pid_n = (lora_tile_id % num_pid_in_group) // trimmed_group_size_m
-    return lora_id, pid_m, pid_n, m_start, expert_id, True
+    return lora_id, pid_n, m_start, expert_id, True
 
 
 @triton.jit(
@@ -127,13 +127,14 @@ def _fused_moe_lora_kernel_persistent(
     NUM_TILE_K: tl.constexpr,
     NUM_TILES: tl.constexpr,
     NUM_SLICES: tl.constexpr,
+    NUM_SMS_PER_SLICE: tl.constexpr
 ):
     tl.static_assert(NUM_SLICES <= 2, "num_slices > 2 is not supported")
     c_type = c_ptr.dtype.element_ty
     
     pid = tl.program_id(axis=0)
-    slice_id = pid // (NUM_SMS // NUM_SLICES)
-    pid = pid % (NUM_SMS // NUM_SLICES)
+    slice_id = pid // NUM_SMS_PER_SLICE
+    pid = pid % NUM_SMS_PER_SLICE
     
     num_blocks_m = NUM_BLOCKS_M
     num_blocks_n = NUM_BLOCKS_N
@@ -146,9 +147,9 @@ def _fused_moe_lora_kernel_persistent(
     n_block = tl.arange(0, BLOCK_SIZE_N)
     k_block = tl.arange(0, BLOCK_SIZE_K)
 
-    for tile_id in tl.range(pid, num_tiles, NUM_SMS//NUM_SLICES):
+    for tile_id in tl.range(pid, num_tiles, NUM_SMS_PER_SLICE):
 
-        lora_id, tile_m_idx, tile_n_idx, m_start, expert_id, is_active = _get_tile_details(
+        lora_id, tile_n_idx, m_start, expert_id, is_active = _get_tile_details(
             tile_id // SPLIT_K, num_pid_in_group, num_blocks_m, GROUP_SIZE_M, num_tiles_per_lora, lora_ids_ptr, 
             adapter_enabled, num_tokens_post_padded_ptr, BLOCK_SIZE_M, stride_el, expert_ids_ptr, MAX_LORAS, MAX_EXPERT_INDEX
         )
@@ -911,6 +912,7 @@ def _fused_moe_lora_shrink(
         shrink_config['NUM_TILE_K'] = triton.cdiv(K, block_size_k * split_k)
         shrink_config['NUM_TILES_PER_LORA'] = num_tiles_per_lora
         shrink_config['NUM_SLICES'] = num_slices
+        shrink_config['NUM_SMS_PER_SLICE'] = NUM_SMS // num_slices
         shrink_config['NUM_TILES'] = num_tiles_per_lora * num_active_loras
         shrink_config['MAX_EXPERT_INDEX'] = lora_a_stacked[0].shape[0]*expert_ids.stride(0)
         shrink_config['SLICE_A_SIZE'] = qcurr_hidden_states.numel()
@@ -1082,6 +1084,7 @@ def _fused_moe_lora_expand(
         expand_config['NUM_TILE_K'] = triton.cdiv(K, block_size_k * split_k)
         expand_config['NUM_TILES_PER_LORA'] = num_tiles_per_lora
         expand_config['NUM_SLICES'] = num_slices
+        expand_config['NUM_SMS_PER_SLICE'] = NUM_SMS // num_slices
         expand_config['NUM_TILES'] = num_tiles_per_lora * num_active_loras
         expand_config['MAX_EXPERT_INDEX'] = lora_b_stacked[0].shape[0]*expert_ids.stride(0)
         expand_config['SLICE_A_SIZE'] = triton.cdiv(EM, top_k_num) * top_k_num
