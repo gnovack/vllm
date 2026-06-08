@@ -287,6 +287,13 @@ class Worker(WorkerBase):
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
+            # Subscribe CUPTI kernel-launch tracing in this worker process, on
+            # the thread that will launch kernels. Best-effort; never fatal.
+            if self.observability_config.enable_cupti:
+                from vllm.v1.worker.cupti_profiler import start_cupti_profiling
+
+                start_cupti_profiling()
+
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure

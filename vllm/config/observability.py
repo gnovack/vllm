@@ -76,6 +76,12 @@ class ObservabilityConfig:
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
 
+    enable_cupti: bool = False
+    """Enable CUPTI kernel-launch tracing in the GPU worker(s). When set, each
+    CUDA kernel launch is logged with its start timestamp, CPU-side launch
+    duration, and demangled kernel name. Requires the 'cupti-python' package.
+    High volume; intended for debugging/profiling."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""
