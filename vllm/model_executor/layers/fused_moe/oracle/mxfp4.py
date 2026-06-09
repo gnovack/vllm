@@ -67,6 +67,9 @@ class Mxfp4MoeBackend(Enum):
     # FlashInfer CUTLASS backends
     FLASHINFER_CUTLASS_MXFP4_MXFP8 = "FLASHINFER_CUTLASS_MXFP4_MXFP8"
     FLASHINFER_CUTLASS_MXFP4_BF16 = "FLASHINFER_CUTLASS_MXFP4_BF16"
+    # FlashInfer CuTe-DSL W4A8 backend: MXFP4 weight + FP8 activation (the kernel
+    # casts the bf16 activation to FP8 internally), Hopper SM90 only.
+    FLASHINFER_CUTEDSL_MXFP4_FP8 = "FLASHINFER_CUTEDSL_MXFP4_FP8"
     # Marlin
     BATCHED_MARLIN = "BATCHED_MARLIN"
     MARLIN = "MARLIN"
@@ -140,6 +143,13 @@ def backend_to_kernel_cls(
         )
 
         return [FlashInferExperts]
+
+    elif backend == Mxfp4MoeBackend.FLASHINFER_CUTEDSL_MXFP4_FP8:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_w4a8_mxfp4_moe import (  # noqa: E501
+            FlashInferCuteDslW4A8Mxfp4Experts,
+        )
+
+        return [FlashInferCuteDslW4A8Mxfp4Experts]
 
     elif backend == Mxfp4MoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
@@ -244,6 +254,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
             Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
         ],
         "flashinfer_cutlass_afp8": [Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8],
+        "flashinfer_cutedsl": [Mxfp4MoeBackend.FLASHINFER_CUTEDSL_MXFP4_FP8],
         "triton": [Mxfp4MoeBackend.TRITON],
         "triton_unfused": [Mxfp4MoeBackend.TRITON_UNFUSED],
         "humming": [Mxfp4MoeBackend.HUMMING],
@@ -675,6 +686,9 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
     ):
+        intermediate_size = round_up(intermediate_size, 128)
+        hidden_size = round_up(hidden_size, 128)
+    elif backend == Mxfp4MoeBackend.FLASHINFER_CUTEDSL_MXFP4_FP8:
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
     elif current_platform.is_rocm():
@@ -1540,6 +1554,29 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTEDSL_MXFP4_FP8:
+        from vllm.model_executor.layers.fused_moe.flashinfer_w4a8_mxfp4.w4a8_mxfp4_moe import (  # noqa: E501
+            interleave_w4a8_fc1_gate_up,
+        )
+
+        # vLLM stores fc1 stacked ([E, 2I, H/2]: rows [0:I]=gate, [I:2I]=up); the
+        # kernel's fused SwiGLU needs the interleaved layout (row 2j=gate_j,
+        # 2j+1=up_j). fc2 and both UE8M0 (uint8) scales pass through unchanged.
+        w13_weight = w13_weight.data.view(torch.uint8)
+        w2_weight = w2_weight.data.view(torch.uint8)
+        w13_weight_scale = w13_weight_scale.data.view(torch.uint8)
+        w2_weight_scale = w2_weight_scale.data.view(torch.uint8)
+        w13_weight, w13_weight_scale = interleave_w4a8_fc1_gate_up(
+            w13_weight, w13_weight_scale
+        )
+        return (
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            None,
+            None,
+        )
     elif mxfp4_backend in (
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
@@ -1664,6 +1701,10 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.TRITON_UNFUSED,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
+        # The CuTe-DSL W4A8 kernel receives bf16 activations (it FP8-quantizes
+        # them internally), so from vLLM's side it needs no activation quant,
+        # same as the W4A16 backends.
+        Mxfp4MoeBackend.FLASHINFER_CUTEDSL_MXFP4_FP8,
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
         Mxfp4MoeBackend.CPU,
     ):
