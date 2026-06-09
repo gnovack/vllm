@@ -127,6 +127,22 @@ Debug environment options:
 """
 
 
+def _elect_sync(*, loc=None, ip=None):
+    """Build an ``nvvm.elect.sync`` op returning the elected-thread i1 predicate.
+
+    The generated MLIR binding for this op is not stable across cutlass-dsl
+    libs builds (even at the same package version): some expose
+    ``elect_sync(<result_type>, *, loc, ip)`` (result type passed positionally),
+    while newer ones infer the result type and expose
+    ``elect_sync(*, membermask=None, loc=None, ip=None)``. Try the
+    positional-type form first and fall back to the type-inferred form.
+    """
+    try:
+        return _nvvm_d.elect_sync(_T.bool(), loc=loc, ip=ip)
+    except TypeError:
+        return _nvvm_d.elect_sync(loc=loc, ip=ip)
+
+
 @_dsl_user_op
 def _tma_load_ab_nvvm_no_mcast(
     k_coord: _Int32,
@@ -160,7 +176,7 @@ def _tma_load_ab_nvvm_no_mcast(
     desc_a_llvm = desc_a.llvm_ptr
     desc_b_llvm = desc_b.llvm_ptr
     # TMA A: elect one thread and issue the load with predicate.
-    is_elected_a = _nvvm_d.elect_sync(_T.bool(), loc=loc, ip=ip)
+    is_elected_a = _elect_sync(loc=loc, ip=ip)
     _nvvm_d.CpAsyncBulkTensorGlobalToSharedClusterOp(
         dstMem=smem_a_llvm,
         tmaDescriptor=desc_a_llvm,
@@ -177,7 +193,7 @@ def _tma_load_ab_nvvm_no_mcast(
         ip=ip,
     )
     # TMA B: elect one thread and issue the load with predicate.
-    is_elected_b = _nvvm_d.elect_sync(_T.bool(), loc=loc, ip=ip)
+    is_elected_b = _elect_sync(loc=loc, ip=ip)
     _nvvm_d.CpAsyncBulkTensorGlobalToSharedClusterOp(
         dstMem=smem_b_llvm,
         tmaDescriptor=desc_b_llvm,
@@ -210,7 +226,7 @@ def _tma_load_b_nvvm_no_mcast(
     smem_b_llvm = smem_b.llvm_ptr
     mbar_llvm = mbar.llvm_ptr
     desc_b_llvm = desc_b.llvm_ptr
-    is_elected_b = _nvvm_d.elect_sync(_T.bool(), loc=loc, ip=ip)
+    is_elected_b = _elect_sync(loc=loc, ip=ip)
     _nvvm_d.CpAsyncBulkTensorGlobalToSharedClusterOp(
         dstMem=smem_b_llvm,
         tmaDescriptor=desc_b_llvm,
