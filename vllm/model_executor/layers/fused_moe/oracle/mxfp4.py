@@ -1540,6 +1540,36 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend in (
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+    ):
+        from flashinfer.fused_moe.core import (
+            interleave_moe_weights_for_sm90_mixed_gemm,
+            interleave_moe_scales_for_sm90_mixed_gemm,
+        )
+        logger.info(f"Cutlass backend: {mxfp4_backend}")
+
+        w13_weight = w13_weight.data
+        w2_weight = w2_weight.data
+        w13_weight_scale = w13_weight_scale.data
+        w2_weight_scale = w2_weight_scale.data
+        
+        w13_weight = interleave_moe_weights_for_sm90_mixed_gemm(w13_weight, "fp4")
+        w2_weight = interleave_moe_weights_for_sm90_mixed_gemm(w2_weight, "fp4")
+        w13_weight_scale = interleave_moe_scales_for_sm90_mixed_gemm(w13_weight_scale)
+        w2_weight_scale = interleave_moe_scales_for_sm90_mixed_gemm(w2_weight_scale)
+
+        w13_bias = None
+        w2_bias = None
+        return (
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "

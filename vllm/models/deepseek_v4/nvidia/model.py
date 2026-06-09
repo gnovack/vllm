@@ -450,6 +450,290 @@ direct_register_custom_op(
 )
 
 
+class DeepseekV4MegaMoEExpertsFP8(nn.Module):
+    """Block-FP8 (e4m3) experts for the DeepGEMM SM90 MegaMoE kernel.
+
+    The fp8 counterpart to ``DeepseekV4MegaMoEExperts`` (which is fp4 / SM100).
+    Selected when ``expert_dtype == "fp8"``. Differences from the fp4 path:
+
+      * weights are ``float8_e4m3fn`` (not 2-per-byte packed uint8),
+      * scales are ``float32`` block-128x128 (not uint8 ue8m0 block-32),
+      * ``finalize_weights`` uses ``transform_weights_for_mega_moe_sm90`` (no
+        ue8m0 decode / sf relayout -- weights/scales are already in kernel form),
+      * the kernel is ``deep_gemm.fp8_mega_moe`` (SM90+),
+      * inputs are staged as per-token fp8 + float32 block-128 scales via
+        ``per_token_cast_to_fp8(..., gran_k=128)`` (the ue8m0 ``prepare_megamoe_inputs``
+        Triton kernel is fp4-only and cannot be reused).
+
+    Uses the standalone ``deep_gemm`` package: the vendored
+    ``vllm.third_party.deep_gemm`` does not ship the SM90 fp8 symbols.
+
+    The forward dispatch reuses the shared ``deepseek_v4_mega_moe_experts``
+    custom op, which looks the module up by name and calls ``_run_mega_moe``.
+    """
+
+    _BLOCK = 128
+    _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        num_experts: int,
+        num_local_experts: int,
+        experts_start_idx: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.prefix = prefix
+        self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
+        self.experts_start_idx = experts_start_idx
+        self.experts_end_idx = experts_start_idx + num_local_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        blk = self._BLOCK
+        weight_attrs = {"weight_loader": self.weight_loader}
+        # w1/w3 fused into w13 along the output (N) dim; full e4m3 elements.
+        self.w13_weight = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                2 * intermediate_size,
+                hidden_size,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_weight, weight_attrs)
+
+        self.w13_weight_scale = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                2 * intermediate_size // blk,
+                hidden_size // blk,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_weight_scale, weight_attrs)
+        self.w13_weight_scale.quant_method = "block"
+
+        self.w2_weight = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                hidden_size,
+                intermediate_size,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_weight, weight_attrs)
+
+        self.w2_weight_scale = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                hidden_size // blk,
+                intermediate_size // blk,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_weight_scale, weight_attrs)
+        self.w2_weight_scale.quant_method = "block"
+
+        self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
+    def _map_global_expert_id(self, expert_id: int) -> int:
+        if expert_id < self.experts_start_idx or expert_id >= self.experts_end_idx:
+            return -1
+        return expert_id - self.experts_start_idx
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        return_success: bool = False,
+    ) -> bool | None:
+        local_expert_id = self._map_global_expert_id(expert_id)
+        if local_expert_id == -1:
+            return False if return_success else None
+
+        expert_data = param.data[local_expert_id]
+        if shard_id in ("w1", "w3"):
+            if "w13_" not in weight_name:
+                return False if return_success else None
+            # The w1/w3 split is the first half of dim 0 -- in element rows for
+            # the weight (2*inter) and in block rows for the scale (2*inter/128).
+            half = expert_data.shape[0] // 2
+            shard_offset = 0 if shard_id == "w1" else half
+            expert_data = expert_data.narrow(0, shard_offset, half)
+        elif shard_id == "w2":
+            if "w2_" not in weight_name:
+                return False if return_success else None
+        else:
+            raise ValueError(f"Unsupported expert shard id: {shard_id}")
+
+        if expert_data.shape != loaded_weight.shape:
+            raise ValueError(
+                f"DeepSeek V4 MegaMoE FP8 expert weight shape mismatch for "
+                f"{weight_name}: parameter shard {tuple(expert_data.shape)} "
+                f"vs checkpoint {tuple(loaded_weight.shape)}"
+            )
+        expert_data.copy_(loaded_weight)
+        return True if return_success else None
+
+    def _check_runtime_supported(self) -> None:
+        if not torch.cuda.is_available():
+            raise NotImplementedError("DeepSeek V4 MegaMoE requires CUDA.")
+        device = self.w13_weight.device
+        if device.type != "cuda":
+            raise NotImplementedError(
+                "DeepSeek V4 MegaMoE expert weights must be loaded on CUDA."
+            )
+        if torch.cuda.get_device_capability(device)[0] < 9:
+            raise NotImplementedError(
+                "DeepGEMM FP8 MegaMoE requires SM90+ (Hopper or newer) GPUs."
+            )
+        if self.hidden_size % self._BLOCK != 0 or self.intermediate_size % self._BLOCK:
+            raise ValueError(
+                "DeepGEMM FP8 MegaMoE requires hidden and intermediate sizes "
+                "to be multiples of 128."
+            )
+
+    def finalize_weights(self) -> None:
+        if self._transformed_l1_weights is not None:
+            return
+
+        self._check_runtime_supported()
+        import deep_gemm
+
+        # Weights are already fp8 and scales already float32 block-128, so they
+        # go straight into the SM90 transform (no ue8m0 decode / sf relayout).
+        self._transformed_l1_weights, self._transformed_l2_weights = (
+            deep_gemm.transform_weights_for_mega_moe_sm90(
+                (self.w13_weight.data, self.w13_weight_scale.data),
+                (self.w2_weight.data, self.w2_weight_scale.data),
+            )
+        )
+        # Drop the loader-side parameters; the kernel only consumes the
+        # transformed views above (see DeepseekV4MegaMoEExperts.finalize_weights).
+        self.w13_weight = None
+        self.w13_weight_scale = None
+        self.w2_weight = None
+        self.w2_weight_scale = None
+
+    def get_symm_buffer(self):
+        import deep_gemm
+
+        group = get_ep_group().device_group
+        device = torch.accelerator.current_device_index()
+        key = (
+            id(group),
+            device,
+            self.num_experts,
+            self.max_num_tokens,
+            self.top_k,
+            self.hidden_size,
+            self.intermediate_size,
+        )
+        symm_buffer = self._symm_buffer_cache.get(key)
+        if symm_buffer is None:
+            symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+                group,
+                self.num_experts,
+                self.max_num_tokens,
+                self.top_k,
+                self.hidden_size,
+                self.intermediate_size,
+            )
+            self._symm_buffer_cache[key] = symm_buffer
+        return symm_buffer
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        activation_clamp: float | None,
+        fast_math: bool = True,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] > self.max_num_tokens:
+            raise ValueError(
+                f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, "
+                f"but the symmetric buffer was sized for {self.max_num_tokens}."
+            )
+        y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        torch.ops.vllm.deepseek_v4_mega_moe_experts(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            y,
+            self.prefix,
+            activation_clamp,
+            fast_math,
+        )
+        return y
+
+    def _run_mega_moe(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        y: torch.Tensor,
+        activation_clamp: float | None,
+        fast_math: bool,
+    ) -> None:
+        import deep_gemm
+        from deep_gemm.utils import per_token_cast_to_fp8
+
+        symm_buffer = self.get_symm_buffer()
+        num_tokens = hidden_states.shape[0]
+        # SM90 fp8 dispatch format: per-token fp8 with float32 block-128 K scales.
+        x_fp8, x_sf = per_token_cast_to_fp8(
+            hidden_states,
+            use_ue8m0=False,
+            gran_k=self._BLOCK,
+            use_packed_ue8m0=False,
+        )
+        symm_buffer.x[:num_tokens].copy_(x_fp8)
+        symm_buffer.x_sf[:num_tokens].copy_(x_sf)
+        symm_buffer.topk_idx[:num_tokens].copy_(topk_ids)
+        symm_buffer.topk_weights[:num_tokens].copy_(topk_weights)
+
+        # Idempotent; also covers the dummy-weight-loading path.
+        self.finalize_weights()
+
+        assert self._transformed_l1_weights is not None
+        assert self._transformed_l2_weights is not None
+        deep_gemm.fp8_mega_moe(
+            y,
+            self._transformed_l1_weights,
+            self._transformed_l2_weights,
+            symm_buffer,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+        )
+
+
+DeepseekV4MegaMoEExpertsFP8.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -485,9 +769,12 @@ class DeepseekV4MoE(nn.Module):
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently supports sqrtsoftplus routing only."
             )
-        if self.use_mega_moe and getattr(config, "expert_dtype", "fp4") != "fp4":
+        if self.use_mega_moe and getattr(config, "expert_dtype", "fp4") not in (
+            "fp4",
+            "fp8",
+        ):
             raise NotImplementedError(
-                "DeepSeek V4 MegaMoE only supports fp4 experts; got expert_dtype="
+                "DeepSeek V4 MegaMoE supports fp4 and fp8 experts; got expert_dtype="
                 f"{config.expert_dtype!r}. Drop --kernel-config moe_backend="
                 "deep_gemm_mega_moe for this checkpoint."
             )
@@ -558,7 +845,13 @@ class DeepseekV4MoE(nn.Module):
         self.experts_start_idx = self.ep_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
-        self.experts = DeepseekV4MegaMoEExperts(
+        # fp8 experts use the SM90 block-FP8 MegaMoE kernel; fp4 the SM100 kernel.
+        experts_cls = (
+            DeepseekV4MegaMoEExpertsFP8
+            if getattr(config, "expert_dtype", "fp4") == "fp8"
+            else DeepseekV4MegaMoEExperts
+        )
+        self.experts = experts_cls(
             vllm_config,
             num_experts=config.n_routed_experts,
             num_local_experts=self.n_local_experts,
