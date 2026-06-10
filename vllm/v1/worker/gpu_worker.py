@@ -287,13 +287,6 @@ class Worker(WorkerBase):
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
-            # Subscribe CUPTI kernel-launch tracing in this worker process, on
-            # the thread that will launch kernels. Best-effort; never fatal.
-            if self.observability_config.enable_cupti:
-                from vllm.v1.worker.cupti_profiler import start_cupti_profiling
-
-                start_cupti_profiling()
-
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
@@ -750,6 +743,19 @@ class Worker(WorkerBase):
         # (model weights, KV caches, CUDA graphs) during inference.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
+
+        # Start CUPTI kernel tracing only now, after all warmup (weight load,
+        # memory profiling, torch.compile, CUDA graph capture) is complete, so
+        # the collected metrics reflect steady-state serving, not warmup passes.
+        # Runs on the worker thread that will launch kernels. Best-effort.
+        if self.observability_config.enable_cupti:
+            from vllm.v1.worker.cupti_profiler import start_cupti_profiling
+
+            start_cupti_profiling(
+                db_dir=self.observability_config.cupti_db_dir,
+                rank=self.rank,
+                model_name=self.model_config.model,
+            )
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,

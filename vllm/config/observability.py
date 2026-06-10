@@ -77,10 +77,15 @@ class ObservabilityConfig:
     and the elapsed cpu time for the iteration."""
 
     enable_cupti: bool = False
-    """Enable CUPTI kernel-launch tracing in the GPU worker(s). When set, each
-    CUDA kernel launch is logged with its start timestamp, CPU-side launch
-    duration, and demangled kernel name. Requires the 'cupti-python' package.
-    High volume; intended for debugging/profiling."""
+    """Enable CUPTI kernel tracing in the GPU worker(s). When set, per-kernel GPU
+    execution metrics are aggregated by (kernel name + vLLM callstack, num_tokens)
+    and snapshotted to a per-rank SQLite database. Requires the 'cupti-python'
+    package. Intended for debugging/profiling."""
+
+    cupti_db_dir: str | None = None
+    """Directory for CUPTI metric SQLite databases (one file per rank,
+    `cupti_metrics.rank{N}.db`). Only used when `enable_cupti` is set. Defaults
+    to `./cupti_metrics` in the worker's working directory when unset."""
 
     @cached_property
     def collect_model_forward_time(self) -> bool:

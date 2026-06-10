@@ -636,6 +636,7 @@ class EngineArgs:
     )
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     enable_cupti: bool = ObservabilityConfig.enable_cupti
+    cupti_db_dir: str | None = ObservabilityConfig.cupti_db_dir
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
@@ -1358,6 +1359,10 @@ class EngineArgs:
         observability_group.add_argument(
             "--enable-cupti",
             **observability_kwargs["enable_cupti"],
+        )
+        observability_group.add_argument(
+            "--cupti-db-dir",
+            **observability_kwargs["cupti_db_dir"],
         )
 
         # Scheduler arguments
@@ -2194,6 +2199,7 @@ class EngineArgs:
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,
             enable_cupti=self.enable_cupti,
+            cupti_db_dir=self.cupti_db_dir,
         )
 
         # Compilation config overrides
