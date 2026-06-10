@@ -79,8 +79,18 @@ _driver_launch_cbids: set = set()
 # order (the callback records (name, stack) in order while _dram_capturing).
 _dram_enabled = False
 _dram_capturing = False
-_dram_order: list = []          # ordered (short_name, full_name, stack) per launch
-_dram_captured: set = set()     # num_tokens already dram-profiled
+_dram_order: list = []          # ordered (short_name, full_name, stack) per WINDOWED launch
+_dram_captured: set = set()     # num_tokens whose kernel sweep is COMPLETE
+# Windowed capture: instead of profiling a whole forward in one (huge) stall, we
+# profile only a WINDOW of _DRAM_WINDOW launches each forward and sweep the window
+# across recurring forwards at the same num_tokens (real traffic repeats sizes).
+# _dram_cursor[num_tokens] = next launch index to profile; _win is per-forward
+# scratch the launch callback drives (start at cursor, stop at cursor+W).
+_DRAM_WINDOW = max(1, int(os.environ.get("VLLM_CUPTI_DRAM_WINDOW", "16")))
+_dram_cursor: dict = {}
+_win: dict = {"cursor": 0, "W": 0, "count": 0, "started": False,
+              "stopped": False, "err": None}
+_cu = None                      # cuda.bindings.driver, set at startup (callback hot path)
 # (stored_name, cupti_metric_name). Base memory counters are always collected;
 # tensor-op (FLOP) counters are added per-GPU-arch at startup (_select_dram_metrics).
 _DRAM_BASE_PAIRS = [
@@ -93,6 +103,7 @@ _orig_execute_model = None
 _model_runner = None
 _ctx_int = 0
 _device = 0
+_dram_session = None            # persistent cupti_range_profiler.RangeSession
 # num_tokens of the forward currently running (set by _wrapped_execute_model),
 # used to key BOTH duration and dram so they share the same num_tokens and join
 # in the unified view. -1 when no forward is in progress.
@@ -243,8 +254,31 @@ def _launch_callback(user_data, domain, callback_id, cbdata):
         return
     stack = _capture_vllm_stack()
     if _dram_capturing:
-        full = _demangle(cbdata.symbol_name)
-        _dram_order.append((_short_kernel_name(full), full, stack))
+        # Windowed capture: count every launch (so we learn the forward's total),
+        # but only Start the profiler at the window's first launch, record the
+        # launches inside the window, and Stop at the launch just past it. Start/
+        # Stop sync first to keep the window's ranges clean (no spillover from
+        # in-flight kernels). Safe to call from here (verified: no re-entrancy
+        # deadlock). Errors stop the window rather than killing the forward.
+        i = _win["count"]
+        _win["count"] = i + 1
+        try:
+            if (_win["started"] and not _win["stopped"]
+                    and i == _win["cursor"] + _win["W"]):
+                _cu.cuCtxSynchronize()
+                _dram_session.stop()
+                _win["stopped"] = True
+            if (i == _win["cursor"] and not _win["started"]
+                    and not _win["stopped"] and _win["err"] is None):
+                _cu.cuCtxSynchronize()
+                _dram_session.start()
+                _win["started"] = True
+            if _win["started"] and not _win["stopped"]:
+                full = _demangle(cbdata.symbol_name)
+                _dram_order.append((_short_kernel_name(full), full, stack))
+        except Exception as e:
+            _win["err"] = repr(e)
+            _win["stopped"] = True
         return  # activity is paused during capture -> no duration record to pair
     with _pending_lock:
         _pending[cbdata.correlation_id] = (stack, _cur_forward_num_tokens)
@@ -391,42 +425,56 @@ def _select_dram_metrics(ctx_int, device, np) -> bool:
 
 
 def _dram_capture(num_tokens, run_forward):
-    """Profile one forward with the Range Profiler and attribute per-range dram
-    bytes to kernels by launch order. Guarantees run_forward() executes exactly
-    once (even if profiling setup/decode errors)."""
+    """Profile ONE WINDOW of this forward's launches on the persistent Range
+    Profiler session, sweeping the window across successive forwards at this
+    num_tokens until every kernel is covered. The launch callback drives
+    start/stop at the window boundaries; here we set up the window, run the
+    forward exactly once, then attribute the window's ranges to its kernels and
+    advance the cursor. Marks num_tokens done once the cursor passes the forward's
+    last launch."""
     global _dram_capturing
-    import numpy as np
-    from vllm.v1.worker import cupti_range_profiler as rp
+    from cuda.bindings import driver as cu
 
-    holder = {}
+    cursor = _dram_cursor.get(num_tokens, 0)
+    _win.update(cursor=cursor, W=_DRAM_WINDOW, count=0, started=False,
+                stopped=False, err=None)
 
-    def _fwd():
-        holder["result"] = run_forward()
-        holder["ran"] = True
-        return holder["result"]
-
-    pause_activity()
+    pause_activity()      # Activity API conflicts with an ACTIVE profiler window
     _dram_order.clear()
-    _dram_capturing = True
     per_range = []
     try:
-        per_range, _ = rp.profile_once(_dram_metrics, _fwd, _ctx_int,
-                                       device=_device, np=np)
+        _dram_session.reset()
     except Exception as e:
-        logger.warning("CUPTI: dram capture failed at num_tokens=%d: %s",
-                       num_tokens, e)
+        logger.warning("CUPTI: dram reset failed at num_tokens=%d: %s; "
+                       "skipping window.", num_tokens, e)
+        resume_activity()
+        return run_forward()
+
+    _dram_capturing = True
+    try:
+        result = run_forward()          # exactly once; exceptions propagate below
     finally:
+        try:
+            if _win["started"] and not _win["stopped"]:   # window ran to fwd end
+                cu.cuCtxSynchronize()
+                _dram_session.stop()
+                _win["stopped"] = True
+            if _win["started"] and _win["err"] is None:
+                per_range = _dram_session.read()
+        except Exception as e:
+            logger.warning("CUPTI: dram stop/read failed at num_tokens=%d: %s",
+                           num_tokens, e)
         _dram_capturing = False
         resume_activity()
-        _dram_captured.add(num_tokens)
+    if _win["err"] is not None:
+        logger.warning("CUPTI: dram window callback error at num_tokens=%d: %s",
+                       num_tokens, _win["err"])
 
-    if not holder.get("ran"):
-        return run_forward()  # setup failed before the forward -> run it now
-
+    total = _win["count"]   # total launches this forward (callback counts all)
     order = list(_dram_order)
     if per_range and len(order) != len(per_range):
-        logger.warning("CUPTI: dram %d ranges vs %d launches at num_tokens=%d; "
-                       "attribution may be approximate.",
+        logger.warning("CUPTI: dram %d ranges vs %d windowed launches at "
+                       "num_tokens=%d; attribution may be approximate.",
                        len(per_range), len(order), num_tokens)
     n = min(len(order), len(per_range))
     with _agg_lock:
@@ -439,8 +487,18 @@ def _dram_capture(num_tokens, run_forward):
                 stored: per_range[i].get(cupti, 0.0)
                 for (stored, cupti) in _dram_metric_pairs
             })
-    logger.info("CUPTI: dram captured num_tokens=%d (%d kernels)", num_tokens, n)
-    return holder["result"]
+
+    nxt = cursor + _DRAM_WINDOW
+    if not _win["started"] or nxt >= total:
+        _dram_captured.add(num_tokens)       # swept to the end -> done
+        _dram_cursor.pop(num_tokens, None)
+        logger.info("CUPTI: dram sweep COMPLETE for num_tokens=%d "
+                    "(%d launches total)", num_tokens, total)
+    else:
+        _dram_cursor[num_tokens] = nxt
+        logger.info("CUPTI: dram window [%d,%d) of ~%d for num_tokens=%d "
+                    "(%d kernels)", cursor, nxt, total, num_tokens, n)
+    return result
 
 
 def _agree_dram_enabled(local_enabled: bool) -> bool:
@@ -490,12 +548,25 @@ def _dram_barrier() -> None:
         pass
 
 
+def _bucket_num_tokens(n: int) -> int:
+    """Bucket the raw token count so the metric table stays small (and a dram
+    sweep only has to finish once per bucket, not per exact value): powers of two
+    up to 1024, then the nearest thousand above that. Applied to BOTH duration and
+    dram so they keep a common key and still join. (n<=1 passes through, incl. the
+    -1 'no forward context' sentinel.)"""
+    if n <= 1:
+        return n
+    if n <= 1024:
+        return 1 << (n - 1).bit_length()        # smallest power of two >= n
+    return max(2000, ((n + 500) // 1000) * 1000)  # nearest thousand, never < 2000
+
+
 def _wrapped_execute_model(scheduler_output, *args, **kwargs):
-    """Wraps every forward so duration AND dram key off the same num_tokens
-    (total_num_scheduled_tokens). dram-captures the first forward at each new
-    num_tokens when dram is enabled."""
+    """Wraps every forward so duration AND dram key off the same (bucketed)
+    num_tokens. dram-sweeps each bucket once when dram is enabled."""
     global _cur_forward_num_tokens
-    num_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", 0)
+    raw = getattr(scheduler_output, "total_num_scheduled_tokens", 0)
+    num_tokens = _bucket_num_tokens(raw)
     _cur_forward_num_tokens = num_tokens
     try:
         if _dram_enabled and num_tokens > 0 and num_tokens not in _dram_captured:
@@ -647,6 +718,7 @@ def start_cupti_profiling(
     global _get_fwd_ctx, _fwd_ctx_available, _vllm_dir, _driver_launch_cbids
     global _flush_thread, _db_path, _rank, _model_name, _run_id
     global _dram_enabled, _orig_execute_model, _model_runner, _ctx_int, _device
+    global _dram_session, _cu
 
     with _lock:
         if _active:
@@ -699,8 +771,9 @@ def start_cupti_profiling(
             _subscriber = cupti.subscribe(_launch_callback, None)
             cupti.enable_domain(1, _subscriber, cupti.CallbackDomain.DRIVER_API)
 
-            # dram bytes via Range Profiler -- opportunistic, one-shot per
-            # num_tokens (needs admin + system libcupti + --enforce-eager).
+            # dram/FLOP bytes via Range Profiler -- opportunistic, swept in small
+            # windows across recurring forwards per num_tokens (needs admin +
+            # system libcupti + --enforce-eager).
             if model_runner is not None and _dram_preflight(enforce_eager):
                 try:
                     from cuda.bindings import driver as _cu
@@ -738,6 +811,31 @@ def start_cupti_profiling(
             # profiled forward runs its collectives exactly once on every rank.
             _dram_enabled = _agree_dram_enabled(_dram_enabled)
 
+            # Build the PERSISTENT Range Profiler session and warm it up now
+            # (pays the one-time ~1.5s first-Start cost here, during warmup,
+            # never during serving). Reused across all per-num_tokens captures.
+            if _dram_enabled:
+                try:
+                    import numpy as _np
+                    from vllm.v1.worker import cupti_range_profiler as _rp
+
+                    _dram_session = _rp.RangeSession(
+                        _dram_metrics, _ctx_int, device=_device, np=_np).begin()
+                    t_warm = time.time()
+                    _dram_session.warmup()
+                    logger.info("CUPTI: range profiler session warmed up in "
+                                "%.1fs (one-time)", time.time() - t_warm)
+                except Exception as e:
+                    logger.warning("CUPTI: range session init failed: %s; "
+                                   "disabling dram.", e)
+                    if _dram_session is not None:
+                        try:
+                            _dram_session.end()
+                        except Exception:
+                            pass
+                    _dram_session = None
+                    _dram_enabled = False
+
             # Wrap execute_model whenever a runner is available so BOTH duration
             # and dram key off the same num_tokens (total_num_scheduled_tokens),
             # which makes them join in the unified view. (Also drives the dram
@@ -762,7 +860,7 @@ def start_cupti_profiling(
 
 def stop_cupti_profiling() -> None:
     """Disable CUPTI tracing, flush a final snapshot, and release resources."""
-    global _active
+    global _active, _dram_session
 
     with _lock:
         if not _active:
@@ -779,9 +877,12 @@ def stop_cupti_profiling() -> None:
             if _subscriber is not None:
                 _cupti.unsubscribe(_subscriber)
             _cupti.activity_disable(_cupti.ActivityKind.CONCURRENT_KERNEL)
+            if _dram_session is not None:
+                _dram_session.end()       # Disable device obj + host deinit
         except Exception as e:
             logger.warning("Failed to disable CUPTI profiling: %s", e)
         finally:
+            _dram_session = None
             _active = False
             with _pending_lock:
                 _pending.clear()

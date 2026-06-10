@@ -249,135 +249,149 @@ def num_passes(metrics, ctx_int, device=0, np=None) -> int:
         _host_deinit(host)
 
 
-def profile_once(metrics, run_forward, ctx_int, device=0, np=None):
-    """Profile a single execution of run_forward() under autorange + kernel
-    replay. Returns (per_range_values, forward_result):
-      per_range_values: list indexed by range (= kernel launch order),
-                        each a {metric: float}.
-      forward_result:   whatever run_forward() returned.
-    run_forward() is invoked exactly ONCE (single-pass metrics only; re-running
-    would corrupt stateful kernels)."""
-    if np is None:
-        import numpy as np
-    chip = chip_name(device).encode()
-    name_ptrs = (C.c_char_p * len(metrics))(*[m.encode() for m in metrics])
-    names_p = C.cast(name_ptrs, _P)
+class RangeSession:
+    """Persistent autorange + kernel-replay session.
 
-    ga = _GetCtrAvail()
-    ga.structSize = _ssize(_GetCtrAvail, "bAllowDeviceLevelCounters")
-    ga.ctx = ctx_int
-    _call("cuptiProfilerGetCounterAvailability", ga)
-    avail = np.zeros(ga.counterAvailabilityImageSize, np.uint8)
-    ga.pCounterAvailabilityImage = avail.ctypes.data
-    _call("cuptiProfilerGetCounterAvailability", ga)
+    Lifecycle: ``begin()`` once (builds the host config + Enables the device
+    range-profiler object + SetConfig), then ``warmup()`` once to pay the large
+    one-time first-``Start`` cost up front (~1.5s on GB100), then per capture:
+    ``reset()`` -> ``start()`` -> run kernels -> ``stop()`` -> ``read()``.
 
-    hi = _HInit()
-    hi.structSize = _ssize(_HInit, "pHostObject")
-    hi.profilerType = PROFILER_TYPE_RANGE
-    hi.pChipName = chip
-    hi.pCounterAvailabilityImage = avail.ctypes.data
-    _call("cuptiProfilerHostInitialize", hi)
-    host = hi.pHostObject
-    try:
-        ca = _HConfigAdd()
-        ca.structSize = _ssize(_HConfigAdd, "numMetrics")
-        ca.pHostObject = host
-        ca.ppMetricNames = names_p
-        ca.numMetrics = len(metrics)
-        _call("cuptiProfilerHostConfigAddMetrics", ca)
-        cs = _HCfgSize()
-        cs.structSize = _ssize(_HCfgSize, "configImageSize")
-        cs.pHostObject = host
-        _call("cuptiProfilerHostGetConfigImageSize", cs)
-        config_image = np.zeros(cs.configImageSize, np.uint8)
-        cig = _HCfgImage()
-        cig.structSize = _ssize(_HCfgImage, "pConfigImage")
-        cig.pHostObject = host
-        cig.configImageSize = config_image.nbytes
-        cig.pConfigImage = config_image.ctypes.data
-        _call("cuptiProfilerHostGetConfigImage", cig)
+    Why persistent: a FRESH Enable/SetConfig re-pays the ~1.5s first-Start cost
+    every time, so we keep ONE object Enabled for the whole worker lifetime.
+    Crucially, an Enabled-but-not-Started object does NOT disturb the CUPTI
+    Activity API, so duration tracing on normal (non-capture) forwards is
+    unaffected; only an active Start/Stop window conflicts with Activity (the
+    caller pauses Activity for the capture window).
+
+    Single-pass metrics only (``num_passes(metrics)==1``): autorange replay would
+    otherwise re-run kernels and corrupt a stateful forward.
+    """
+
+    def __init__(self, metrics, ctx_int, device=0, np=None, max_ranges=_MAX_RANGES):
+        if np is None:
+            import numpy as np
+        self._np = np
+        self.metrics = list(metrics)
+        self.ctx_int = ctx_int
+        self.device = device
+        self.max_ranges = max_ranges
+        self._obj = None
+        self._host = None
+
+    def begin(self):
+        np = self._np
+        host, config_image, name_ptrs, names_p = _build_config_image(
+            self.metrics, self.ctx_int, self.device, np)
+        self._host = host
+        self._config_image = config_image      # keep refs alive for the session
+        self._name_ptrs = name_ptrs
+        self._names_p = names_p
 
         en = _Enable()
         en.structSize = _ssize(_Enable, "pRangeProfilerObject")
-        en.ctx = ctx_int
+        en.ctx = self.ctx_int
         _call("cuptiRangeProfilerEnable", en)
-        obj = en.pRangeProfilerObject
-        try:
-            gs = _GetCDSize()
-            gs.structSize = _ssize(_GetCDSize, "counterDataSize")
-            gs.pRangeProfilerObject = obj
-            gs.pMetricNames = names_p
-            gs.numMetrics = len(metrics)
-            gs.maxNumOfRanges = _MAX_RANGES
-            gs.maxNumRangeTreeNodes = _MAX_RANGES
-            _call("cuptiRangeProfilerGetCounterDataSize", gs)
-            counter_data = np.zeros(gs.counterDataSize, np.uint8)
-            ci = _CDInit()
-            ci.structSize = _ssize(_CDInit, "pCounterData")
-            ci.pRangeProfilerObject = obj
-            ci.counterDataSize = counter_data.nbytes
-            ci.pCounterData = counter_data.ctypes.data
-            _call("cuptiRangeProfilerCounterDataImageInitialize", ci)
+        self._obj = en.pRangeProfilerObject
 
-            sc = _SetConfig()
-            sc.structSize = _ssize(_SetConfig, "targetNestingLevel")
-            sc.pRangeProfilerObject = obj
-            sc.configSize = config_image.nbytes
-            sc.pConfig = config_image.ctypes.data
-            sc.counterDataImageSize = counter_data.nbytes
-            sc.pCounterDataImage = counter_data.ctypes.data
-            sc.range = AUTO_RANGE
-            sc.replayMode = KERNEL_REPLAY
-            sc.maxRangesPerPass = _MAX_RANGES
-            sc.numNestingLevels = 1
-            sc.minNestingLevel = 1
-            sc.passIndex = 0
-            sc.targetNestingLevel = 1
-            _call("cuptiRangeProfilerSetConfig", sc)
+        gs = _GetCDSize()
+        gs.structSize = _ssize(_GetCDSize, "counterDataSize")
+        gs.pRangeProfilerObject = self._obj
+        gs.pMetricNames = names_p
+        gs.numMetrics = len(self.metrics)
+        gs.maxNumOfRanges = self.max_ranges
+        gs.maxNumRangeTreeNodes = self.max_ranges
+        _call("cuptiRangeProfilerGetCounterDataSize", gs)
+        self._counter_data = np.zeros(gs.counterDataSize, np.uint8)
+        self.reset()
 
-            st = _Start()
-            st.structSize = _ssize(_Start, "pRangeProfilerObject")
-            st.pRangeProfilerObject = obj
-            _call("cuptiRangeProfilerStart", st)
-            result = run_forward()  # exactly once
-            sp = _Stop()
-            sp.structSize = _ssize(_Stop, "isAllPassSubmitted")
-            sp.pRangeProfilerObject = obj
-            _call("cuptiRangeProfilerStop", sp)
+        sc = _SetConfig()
+        sc.structSize = _ssize(_SetConfig, "targetNestingLevel")
+        sc.pRangeProfilerObject = self._obj
+        sc.configSize = config_image.nbytes
+        sc.pConfig = config_image.ctypes.data
+        sc.counterDataImageSize = self._counter_data.nbytes
+        sc.pCounterDataImage = self._counter_data.ctypes.data
+        sc.range = AUTO_RANGE
+        sc.replayMode = KERNEL_REPLAY
+        sc.maxRangesPerPass = self.max_ranges
+        sc.numNestingLevels = 1
+        sc.minNestingLevel = 1
+        sc.passIndex = 0
+        sc.targetNestingLevel = 1
+        _call("cuptiRangeProfilerSetConfig", sc)
+        return self
 
-            dd = _Decode()
-            dd.structSize = _ssize(_Decode, "numOfRangeDropped")
-            dd.pRangeProfilerObject = obj
-            _call("cuptiRangeProfilerDecodeData", dd)
-        finally:
-            dis = _Disable()
-            dis.structSize = _ssize(_Disable, "pRangeProfilerObject")
-            dis.pRangeProfilerObject = obj
-            _call("cuptiRangeProfilerDisable", dis)
+    def reset(self):
+        """Clear the counter-data image so the next start/stop records a fresh
+        set of ranges (otherwise ranges accumulate across captures)."""
+        ci = _CDInit()
+        ci.structSize = _ssize(_CDInit, "pCounterData")
+        ci.pRangeProfilerObject = self._obj
+        ci.counterDataSize = self._counter_data.nbytes
+        ci.pCounterData = self._counter_data.ctypes.data
+        _call("cuptiRangeProfilerCounterDataImageInitialize", ci)
 
+    def start(self):
+        st = _Start()
+        st.structSize = _ssize(_Start, "pRangeProfilerObject")
+        st.pRangeProfilerObject = self._obj
+        _call("cuptiRangeProfilerStart", st)
+
+    def stop(self) -> bool:
+        sp = _Stop()
+        sp.structSize = _ssize(_Stop, "isAllPassSubmitted")
+        sp.pRangeProfilerObject = self._obj
+        _call("cuptiRangeProfilerStop", sp)
+        return bool(sp.isAllPassSubmitted)
+
+    def warmup(self):
+        """Pay the one-time ~1.5s first-Start cost now (call before serving)."""
+        self.reset()
+        self.start()
+        self.stop()
+        self.reset()
+
+    def read(self):
+        """Decode + evaluate; returns a list indexed by range (= kernel launch
+        order), each a {metric: float}."""
+        np = self._np
+        dd = _Decode()
+        dd.structSize = _ssize(_Decode, "numOfRangeDropped")
+        dd.pRangeProfilerObject = self._obj
+        _call("cuptiRangeProfilerDecodeData", dd)
         gi = _CDInfo()
         gi.structSize = _ssize(_CDInfo, "numTotalRanges")
-        gi.pCounterDataImage = counter_data.ctypes.data
-        gi.counterDataImageSize = counter_data.nbytes
+        gi.pCounterDataImage = self._counter_data.ctypes.data
+        gi.counterDataImageSize = self._counter_data.nbytes
         _call("cuptiRangeProfilerGetCounterDataInfo", gi)
-
         per_range = []
         for i in range(gi.numTotalRanges):
-            vals = np.zeros(len(metrics), np.float64)
+            vals = np.zeros(len(self.metrics), np.float64)
             ev = _HEval()
             ev.structSize = _ssize(_HEval, "pMetricValues")
-            ev.pHostObject = host
-            ev.pCounterDataImage = counter_data.ctypes.data
-            ev.counterDataImageSize = counter_data.nbytes
+            ev.pHostObject = self._host
+            ev.pCounterDataImage = self._counter_data.ctypes.data
+            ev.counterDataImageSize = self._counter_data.nbytes
             ev.rangeIndex = i
-            ev.ppMetricNames = names_p
-            ev.numMetrics = len(metrics)
+            ev.ppMetricNames = self._names_p
+            ev.numMetrics = len(self.metrics)
             ev.pMetricValues = vals.ctypes.data
             _call("cuptiProfilerHostEvaluateToGpuValues", ev)
-            per_range.append({m: float(v) for m, v in zip(metrics, vals)})
-        return per_range, result
-    finally:
-        hd = _HDeinit()
-        hd.structSize = _ssize(_HDeinit, "pHostObject")
-        hd.pHostObject = host
-        _call("cuptiProfilerHostDeinitialize", hd)
+            per_range.append({m: float(v) for m, v in zip(self.metrics, vals)})
+        return per_range
+
+    def end(self):
+        if self._obj is not None:
+            try:
+                dis = _Disable()
+                dis.structSize = _ssize(_Disable, "pRangeProfilerObject")
+                dis.pRangeProfilerObject = self._obj
+                _call("cuptiRangeProfilerDisable", dis)
+            finally:
+                self._obj = None
+        if self._host is not None:
+            try:
+                _host_deinit(self._host)
+            finally:
+                self._host = None
