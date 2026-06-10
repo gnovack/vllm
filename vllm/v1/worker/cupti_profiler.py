@@ -72,6 +72,53 @@ _STACK_MAX_FRAMES = 12
 _vllm_dir = ""
 _driver_launch_cbids: set = set()
 
+# ---- dram-bytes via Range Profiler (one-shot per num_tokens) ---------------
+# The Range Profiler reads HW counters (works on cuBLAS GEMMs, unlike SASS) but
+# conflicts with the Activity API, so we PAUSE activity for each capture forward,
+# profile it once (autorange), and attribute each range to a kernel by launch
+# order (the callback records (name, stack) in order while _dram_capturing).
+_dram_enabled = False
+_dram_capturing = False
+_dram_order: list = []          # ordered (short_name, full_name, stack) per launch
+_dram_captured: set = set()     # num_tokens already dram-profiled
+# (stored_name, cupti_metric_name). Base memory counters are always collected;
+# tensor-op (FLOP) counters are added per-GPU-arch at startup (_select_dram_metrics).
+_DRAM_BASE_PAIRS = [
+    ("dram_bytes_read", "dram__bytes_read.sum"),
+    ("dram_bytes_write", "dram__bytes_write.sum"),
+]
+_dram_metric_pairs = list(_DRAM_BASE_PAIRS)            # finalized in start
+_dram_metrics = [c for _, c in _dram_metric_pairs]     # cupti names for Range Profiler
+_orig_execute_model = None
+_model_runner = None
+_ctx_int = 0
+_device = 0
+# num_tokens of the forward currently running (set by _wrapped_execute_model),
+# used to key BOTH duration and dram so they share the same num_tokens and join
+# in the unified view. -1 when no forward is in progress.
+_cur_forward_num_tokens = -1
+
+
+def pause_activity() -> None:
+    """Stop CONCURRENT_KERNEL activity tracing (it conflicts with the Range
+    Profiler; counts come back 0 while activity is enabled). Flush first."""
+    if not _active:
+        return
+    try:
+        _cupti.activity_flush_all(1)
+        _cupti.activity_disable(_cupti.ActivityKind.CONCURRENT_KERNEL)
+    except Exception as e:
+        logger.warning("CUPTI: pause_activity failed: %s", e)
+
+
+def resume_activity() -> None:
+    if not _active:
+        return
+    try:
+        _cupti.activity_enable(_cupti.ActivityKind.CONCURRENT_KERNEL)
+    except Exception as e:
+        logger.warning("CUPTI: resume_activity failed: %s", e)
+
 # ---- in-memory aggregate (source of truth) --------------------------------
 # kernel_id -> (short_name, full_name, stack)
 _registry: dict = {}
@@ -156,7 +203,13 @@ def _capture_vllm_stack() -> str:
     while f is not None and len(frames) < _STACK_MAX_FRAMES:
         code = f.f_code
         filename = code.co_filename
-        if filename.startswith(_vllm_dir) and filename != __file__:
+        # Keep vLLM frames, but exclude our own profiler modules (cupti_*.py).
+        # During a dram capture the call chain passes through
+        # cupti_range_profiler.py(profile_once) etc., which are under the vLLM
+        # dir; including them would make the dram stack differ from the duration
+        # stack and break the kernel_id join.
+        if (filename.startswith(_vllm_dir)
+                and not os.path.basename(filename).startswith("cupti_")):
             rel = filename[len(_vllm_dir) + 1 :]
             frames.append(f"{rel}:{f.f_lineno}({code.co_name})")
         f = f.f_back
@@ -179,7 +232,9 @@ def _get_num_tokens():
 
 
 def _launch_callback(user_data, domain, callback_id, cbdata):
-    """DRIVER-domain launch callback: stash callstack + num_tokens by corr id."""
+    """DRIVER-domain launch callback (API_ENTER): stash callstack + num_tokens by
+    correlation_id for duration attribution; while a dram capture forward is
+    running, also record (name, stack) in launch order for range attribution."""
     if domain != _cupti.CallbackDomain.DRIVER_API:
         return
     if callback_id not in _driver_launch_cbids:
@@ -187,9 +242,12 @@ def _launch_callback(user_data, domain, callback_id, cbdata):
     if cbdata.callback_site != _cupti.ApiCallbackSite.API_ENTER:
         return
     stack = _capture_vllm_stack()
-    num_tokens = _get_num_tokens()
+    if _dram_capturing:
+        full = _demangle(cbdata.symbol_name)
+        _dram_order.append((_short_kernel_name(full), full, stack))
+        return  # activity is paused during capture -> no duration record to pair
     with _pending_lock:
-        _pending[cbdata.correlation_id] = (stack, num_tokens)
+        _pending[cbdata.correlation_id] = (stack, _cur_forward_num_tokens)
         if len(_pending) > _MAX_PENDING:
             _pending.popitem(last=False)
 
@@ -227,7 +285,8 @@ def _buffer_completed(activities: list):
             duration = activity.end - activity.start
             full_name = _demangle(activity.name)
             with _pending_lock:
-                stack, num_tokens = _pending.pop(activity.correlation_id, (None, None))
+                stack, num_tokens = _pending.pop(
+                    activity.correlation_id, (None, None))
         except Exception:
             continue
 
@@ -245,12 +304,224 @@ def _buffer_completed(activities: list):
 
 
 # ---------------------------------------------------------------------------
+# dram bytes via the Range Profiler (one-shot per num_tokens)
+# ---------------------------------------------------------------------------
+def _dram_preflight(enforce_eager) -> bool:
+    if not enforce_eager:
+        logger.warning("CUPTI: dram metrics need --enforce-eager (graph replay "
+                       "isn't profilable); collecting duration only.")
+        return False
+    if os.geteuid() != 0:
+        logger.warning("CUPTI: dram metrics need admin (HW counters are gated by "
+                       "RmProfilingAdminOnly); run as root. Duration only.")
+        return False
+    try:
+        with open(f"/proc/{os.getpid()}/maps") as f:
+            sys_cupti = any("libcupti" in ln and "site-packages" not in ln
+                            and "/nvidia/" not in ln for ln in f)
+        if not sys_cupti:
+            logger.warning("CUPTI: dram metrics need the system libcupti preloaded "
+                           "(LD_PRELOAD=.../libcupti.so.13); duration only.")
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _tensor_op_candidates(cc_major: int):
+    """Per-GPU-arch tensor-op (math op count) metrics, as (stored_name, cupti).
+    Blackwell (sm_100+) uses the UTC* tensor-core path; Hopper (sm_90) and
+    earlier use hmma/imma/qmma. Invalid names for a given chip are filtered out
+    at startup, so over-listing is harmless."""
+    if cc_major >= 10:  # Blackwell
+        base = "sm__ops_path_tensor_op_utc"
+        fp8 = base + "qmma_src_fp4_fp6_fp8_dst_fp32_sparsity_off.sum"
+    else:               # Hopper / Ampere / Ada
+        base = "sm__ops_path_tensor_op_"
+        fp8 = base + "qmma_src_e4m3_dst_fp32_sparsity_off.sum"
+    # Order = priority: a single HW pass only fits dram + a couple of distinct
+    # tensor-core pipes, and the greedy selector (_select_dram_metrics) keeps the
+    # ones listed first. For vLLM inference the dominant GEMM dtypes are bf16 and
+    # fp8 (quantized), so they come before fp16/tf32, which are rarely the main
+    # path in serving. fp16/tf32 share bf16's hmma counter and ride along for
+    # free when they fit.
+    return [
+        ("tensor_ops_bf16", base + "hmma_src_bf16_dst_fp32_sparsity_off.sum"),
+        ("tensor_ops_fp8", fp8),
+        ("tensor_ops_int8", base + "imma_src_int8_sparsity_off.sum"),
+        ("tensor_ops_fp16", base + "hmma_src_fp16_dst_fp32_sparsity_off.sum"),
+        ("tensor_ops_tf32", base + "hmma_src_tf32_dst_fp32_sparsity_off.sum"),
+    ]
+
+
+def _select_dram_metrics(ctx_int, device, np) -> bool:
+    """Finalize _dram_metric_pairs / _dram_metrics = base memory counters + the
+    arch-appropriate tensor-op counters that are (a) valid on this chip and
+    (b) keep the whole set SINGLE-PASS. Returns False if even the base memory
+    counters aren't single-pass (then dram is disabled)."""
+    global _dram_metric_pairs, _dram_metrics
+    from cuda.bindings import driver as cu
+    from vllm.v1.worker import cupti_range_profiler as rp
+
+    def passes(pairs):
+        return rp.num_passes([c for _, c in pairs], ctx_int, device=device, np=np)
+
+    try:
+        if passes(_DRAM_BASE_PAIRS) != 1:
+            logger.warning("CUPTI: base dram counters not single-pass; disabling dram.")
+            return False
+    except Exception as e:
+        logger.warning("CUPTI: dram base-metric check failed: %s; disabling dram.", e)
+        return False
+
+    err, major = cu.cuDeviceGetAttribute(
+        cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device)
+    cc_major = int(major) if int(err) == 0 else 0
+
+    accepted = list(_DRAM_BASE_PAIRS)
+    for stored, cupti in _tensor_op_candidates(cc_major):
+        try:
+            if passes(accepted + [(stored, cupti)]) == 1:  # valid + still 1 pass
+                accepted.append((stored, cupti))
+        except Exception:
+            pass  # metric name invalid on this chip -> skip
+    _dram_metric_pairs = accepted
+    _dram_metrics = [c for _, c in accepted]
+    return True
+
+
+def _dram_capture(num_tokens, run_forward):
+    """Profile one forward with the Range Profiler and attribute per-range dram
+    bytes to kernels by launch order. Guarantees run_forward() executes exactly
+    once (even if profiling setup/decode errors)."""
+    global _dram_capturing
+    import numpy as np
+    from vllm.v1.worker import cupti_range_profiler as rp
+
+    holder = {}
+
+    def _fwd():
+        holder["result"] = run_forward()
+        holder["ran"] = True
+        return holder["result"]
+
+    pause_activity()
+    _dram_order.clear()
+    _dram_capturing = True
+    per_range = []
+    try:
+        per_range, _ = rp.profile_once(_dram_metrics, _fwd, _ctx_int,
+                                       device=_device, np=np)
+    except Exception as e:
+        logger.warning("CUPTI: dram capture failed at num_tokens=%d: %s",
+                       num_tokens, e)
+    finally:
+        _dram_capturing = False
+        resume_activity()
+        _dram_captured.add(num_tokens)
+
+    if not holder.get("ran"):
+        return run_forward()  # setup failed before the forward -> run it now
+
+    order = list(_dram_order)
+    if per_range and len(order) != len(per_range):
+        logger.warning("CUPTI: dram %d ranges vs %d launches at num_tokens=%d; "
+                       "attribution may be approximate.",
+                       len(per_range), len(order), num_tokens)
+    n = min(len(order), len(per_range))
+    with _agg_lock:
+        for i in range(n):
+            short, full, stack = order[i]
+            kid = _kernel_id(full, stack)
+            if kid not in _registry:
+                _registry[kid] = (short, full, stack)
+            _record_metrics(kid, num_tokens, {
+                stored: per_range[i].get(cupti, 0.0)
+                for (stored, cupti) in _dram_metric_pairs
+            })
+    logger.info("CUPTI: dram captured num_tokens=%d (%d kernels)", num_tokens, n)
+    return holder["result"]
+
+
+def _agree_dram_enabled(local_enabled: bool) -> bool:
+    """Collectively AND the dram-enabled flag across ALL ranks so dram capture
+    runs everywhere or nowhere. A partial enable would make one rank enter the
+    slow profiled forward while peers run the fast path -> the forward's
+    collectives deadlock. Best-effort: single-process returns the local value;
+    on any collective error we disable dram (the safe default for >1 rank)."""
+    try:
+        import torch
+
+        if not (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            return local_enabled  # single process / no distributed
+        from vllm.distributed.parallel_state import get_world_group
+
+        grp = get_world_group()
+        if grp.world_size <= 1:
+            return local_enabled
+        t = torch.tensor([1 if local_enabled else 0], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MIN, group=grp.cpu_group)
+        agreed = bool(t.item() == 1)
+        if agreed != local_enabled:
+            logger.info("CUPTI: dram-enable agreed across ranks: %s -> %s "
+                        "(runs everywhere or nowhere)", local_enabled, agreed)
+        return agreed
+    except Exception as e:
+        logger.warning("CUPTI: dram-enable agreement failed (%s); disabling dram "
+                       "to avoid a partial-enable deadlock.", e)
+        return False
+
+
+def _dram_barrier() -> None:
+    """Barrier the tensor-parallel group before a profiled forward. Scoped to the
+    TP group on purpose: TP ranks share scheduler_output (same num_tokens, same
+    capture decision) so they arrive together, while PP/DP ranks live in other
+    groups and would deadlock if coupled here. Uses the group's CPU (gloo) barrier
+    (its NCCL barrier mishandles the current device). Best-effort."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        grp = get_tp_group()
+        if grp.world_size > 1:
+            grp.barrier()
+    except Exception:
+        pass
+
+
+def _wrapped_execute_model(scheduler_output, *args, **kwargs):
+    """Wraps every forward so duration AND dram key off the same num_tokens
+    (total_num_scheduled_tokens). dram-captures the first forward at each new
+    num_tokens when dram is enabled."""
+    global _cur_forward_num_tokens
+    num_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", 0)
+    _cur_forward_num_tokens = num_tokens
+    try:
+        if _dram_enabled and num_tokens > 0 and num_tokens not in _dram_captured:
+            # Align TP ranks before the (slow) profiled forward so Range Profiler
+            # session setup overhead is symmetric and no rank is left blocked at a
+            # collective inside the forward. TP ranks share scheduler_output, so
+            # they reach this together; the barrier is scoped to the TP group only
+            # (PP/DP ranks are in other groups and must NOT be coupled here).
+            _dram_barrier()
+            return _dram_capture(
+                num_tokens,
+                lambda: _orig_execute_model(scheduler_output, *args, **kwargs))
+        return _orig_execute_model(scheduler_output, *args, **kwargs)
+    finally:
+        _cur_forward_num_tokens = -1
+
+
+# ---------------------------------------------------------------------------
 # SQLite snapshotting (flush thread owns the connection)
 # ---------------------------------------------------------------------------
 def _open_db() -> sqlite3.Connection:
     """Create/clear the per-rank DB and write run metadata. Flush-thread only."""
     os.makedirs(os.path.dirname(_db_path), exist_ok=True)
     conn = sqlite3.connect(_db_path)
+    # WAL so a reader can read while the server is still writing. The reader must
+    # open with mode=ro (NOT immutable) so it sees the live -wal contents.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     # Fresh data per server run.
@@ -359,16 +630,23 @@ def _flush_loop():
 # Public API
 # ---------------------------------------------------------------------------
 def start_cupti_profiling(
-    db_dir: "str | None" = None, rank: int = 0, model_name: str = ""
+    db_dir: "str | None" = None, rank: int = 0, model_name: str = "",
+    model_runner=None, enforce_eager: bool = False,
 ) -> None:
     """Enable CUPTI kernel metric collection (idempotent, best-effort).
 
-    Must be called from the GPU worker process. Failures (missing cupti-python,
-    enable errors) are logged and swallowed so they never bring down the worker.
+    Always collects per-kernel GPU duration (Activity API). Additionally collects
+    per-kernel dram bytes (Range Profiler, one-shot per num_tokens) when the
+    prerequisites are met (admin + system libcupti preloaded + --enforce-eager);
+    otherwise dram is skipped with a warning and duration still works.
+
+    Must be called from the GPU worker process. Failures are logged and swallowed
+    so they never bring down the worker.
     """
     global _active, _cupti, _demangle, _kernel_kinds, _subscriber
     global _get_fwd_ctx, _fwd_ctx_available, _vllm_dir, _driver_launch_cbids
     global _flush_thread, _db_path, _rank, _model_name, _run_id
+    global _dram_enabled, _orig_execute_model, _model_runner, _ctx_int, _device
 
     with _lock:
         if _active:
@@ -421,6 +699,54 @@ def start_cupti_profiling(
             _subscriber = cupti.subscribe(_launch_callback, None)
             cupti.enable_domain(1, _subscriber, cupti.CallbackDomain.DRIVER_API)
 
+            # dram bytes via Range Profiler -- opportunistic, one-shot per
+            # num_tokens (needs admin + system libcupti + --enforce-eager).
+            if model_runner is not None and _dram_preflight(enforce_eager):
+                try:
+                    from cuda.bindings import driver as _cu
+                    import numpy as _np
+
+                    _, ctx = _cu.cuCtxGetCurrent()
+                    _ctx_int = int(ctx)
+                    _device = 0
+                    # Finalize the metric set: base memory counters + whatever
+                    # tensor-op (FLOP) counters this GPU's arch supports, keeping
+                    # the set single-pass (see _select_dram_metrics). Multi-pass
+                    # would make the Range Profiler replay kernels, re-running the
+                    # (stateful) forward -> corruption, so we only ever keep a
+                    # single-pass set.
+                    if _select_dram_metrics(_ctx_int, _device, _np):
+                        _dram_enabled = True
+                        logger.info("CUPTI: dram/FLOP metrics enabled (Range "
+                                    "Profiler, single-pass, one-shot per "
+                                    "num_tokens): %s", _dram_metrics)
+                    else:
+                        _dram_enabled = False
+                        logger.warning("CUPTI: base dram metric set %s is not "
+                                       "single-pass; disabling dram/FLOP capture.",
+                                       _dram_metrics)
+                except Exception as e:
+                    logger.warning("CUPTI: dram setup failed: %s", e)
+                    _dram_enabled = False
+
+            # Multi-GPU safety: dram capture must run on EVERY rank or none. A
+            # partial enable (e.g. one node missing the libcupti preload) would
+            # send one rank into the slow profiled forward while peers take the
+            # fast path -> their in-forward collectives deadlock / time out.
+            # Agree on the flag across all ranks (every rank reaches this, dram
+            # attempted or not). Single-pass is already enforced above, so the
+            # profiled forward runs its collectives exactly once on every rank.
+            _dram_enabled = _agree_dram_enabled(_dram_enabled)
+
+            # Wrap execute_model whenever a runner is available so BOTH duration
+            # and dram key off the same num_tokens (total_num_scheduled_tokens),
+            # which makes them join in the unified view. (Also drives the dram
+            # one-shot capture when enabled.)
+            if model_runner is not None:
+                _orig_execute_model = model_runner.execute_model
+                _model_runner = model_runner
+                model_runner.execute_model = _wrapped_execute_model
+
             _flush_stop.clear()
             _flush_thread = threading.Thread(
                 target=_flush_loop, name="cupti-flush", daemon=True
@@ -448,6 +774,8 @@ def stop_cupti_profiling() -> None:
             _flush_stop.set()
             if _flush_thread is not None:
                 _flush_thread.join(timeout=_FLUSH_INTERVAL_S + 5.0)
+            if _orig_execute_model is not None and _model_runner is not None:
+                _model_runner.execute_model = _orig_execute_model
             if _subscriber is not None:
                 _cupti.unsubscribe(_subscriber)
             _cupti.activity_disable(_cupti.ActivityKind.CONCURRENT_KERNEL)

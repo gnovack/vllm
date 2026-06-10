@@ -39,7 +39,8 @@ def load(path: str):
     kernels: dict = {}
     agg: dict = {}
     for f in _db_files(path):
-        conn = sqlite3.connect(f)
+        # read-only: dram-enabled DBs are written under sudo (root-owned)
+        conn = sqlite3.connect(f"file:{f}?mode=ro", uri=True)
         try:
             for kid, name, stack in conn.execute(
                 "SELECT kernel_id, name, stack FROM kernels"
@@ -147,11 +148,83 @@ def plot(kernels, agg, metric: str, top: int, name_filter, out_png: str):
     print(f"wrote {out_png}")
 
 
+_ABBR = {
+    "gpu_dur_ns": "dur_ns",
+    "dram_bytes_read": "dram_rd",
+    "dram_bytes_write": "dram_wr",
+    "tensor_ops_bf16": "flop_bf16",
+    "tensor_ops_fp16": "flop_fp16",
+    "tensor_ops_tf32": "flop_tf32",
+    "tensor_ops_int8": "iop_int8",
+    "tensor_ops_fp8": "flop_fp8",
+    "sass_sectors_mem_global": "g_sectors",
+    "sass_sectors_mem_global_ideal": "g_sect_ideal",
+    "sass_inst_executed": "inst",
+    "sass_inst_executed_op_global_ld": "g_ld",
+    "sass_inst_executed_op_global_st": "g_st",
+}
+
+
+def _abbr(metric: str) -> str:
+    return _ABBR.get(metric, metric.replace("sass_", ""))[:13]
+
+
+def unified_report(kernels, agg, top: int, name_filter):
+    """One row per (kernel, num_tokens); every metric (duration + SASS, merged
+    across both DB kinds by kernel_id) shown as a column of per-launch means."""
+    metrics = sorted({m for (_, _, m) in agg})
+    primary = "gpu_dur_ns" if "gpu_dur_ns" in metrics else (metrics[0] if metrics else None)
+    if primary is None:
+        print("No metrics found.")
+        return
+
+    # kid -> num_tokens -> metric -> (count,sum,sum_sq,min,max); plus ranking total
+    per_kernel: dict = {}
+    totals: dict = {}
+    for (kid, ntok, m), st in agg.items():
+        per_kernel.setdefault(kid, {}).setdefault(ntok, {})[m] = st
+        if m == primary:
+            totals[kid] = totals.get(kid, 0.0) + st[1]
+
+    ranked = sorted(per_kernel, key=lambda k: totals.get(k, 0.0), reverse=True)
+    if name_filter:
+        ranked = [k for k in ranked if name_filter in kernels.get(k, ("", ""))[0]]
+    if top:
+        ranked = ranked[:top]
+
+    cols = ([primary] + [m for m in metrics if m != primary])
+    legend = ", ".join(f"{_abbr(m)}={m}" for m in cols)
+    print(f"metrics (per-launch mean): {legend}")
+    print(f"ranked by total {primary}\n")
+
+    for kid in ranked:
+        name, stack = kernels.get(kid, ("<unknown>", ""))
+        print("=" * 110)
+        print(f"{name}")
+        print(f"  id={kid}" + (f"  stack: {stack}" if stack else ""))
+        header = f"  {'num_tokens':>10}" + "".join(f"{_abbr(m):>15}" for m in cols)
+        print(header)
+        for ntok in sorted(per_kernel[kid]):
+            mvals = per_kernel[kid][ntok]
+            label = "no-ctx" if ntok < 0 else str(ntok)
+            cells = ""
+            for m in cols:
+                if m in mvals:
+                    cnt, s = mvals[m][0], mvals[m][1]
+                    cells += f"{s / cnt:>15,.0f}"
+                else:
+                    cells += f"{'-':>15}"
+            print(f"  {label:>10}{cells}")
+    print("=" * 110)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", help="DB file or directory of per-rank *.db files")
-    ap.add_argument("--metric", default="gpu_dur_ns")
+    ap.add_argument("--metric", default=None,
+                    help="drill into a single metric (count/min/max/std + --plot). "
+                         "Omit for the unified per-kernel view of ALL metrics.")
     ap.add_argument("--top", type=int, default=20, help="show top-N kernels by total")
     ap.add_argument("--filter", dest="name_filter", default=None,
                     help="only kernels whose name contains this substring")
@@ -159,9 +232,14 @@ def main():
     args = ap.parse_args()
 
     kernels, agg = load(args.path)
-    report(kernels, agg, args.metric, args.top, args.name_filter)
-    if args.plot:
-        plot(kernels, agg, args.metric, args.top, args.name_filter, args.plot)
+    if args.metric:
+        report(kernels, agg, args.metric, args.top, args.name_filter)
+        if args.plot:
+            plot(kernels, agg, args.metric, args.top, args.name_filter, args.plot)
+    else:
+        unified_report(kernels, agg, args.top, args.name_filter)
+        if args.plot:
+            sys.exit("--plot requires --metric (pick one metric to plot)")
 
 
 if __name__ == "__main__":

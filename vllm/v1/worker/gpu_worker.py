@@ -747,7 +747,10 @@ class Worker(WorkerBase):
         # Start CUPTI kernel tracing only now, after all warmup (weight load,
         # memory profiling, torch.compile, CUDA graph capture) is complete, so
         # the collected metrics reflect steady-state serving, not warmup passes.
-        # Runs on the worker thread that will launch kernels. Best-effort.
+        # Runs on the worker thread that will launch kernels. Collects per-kernel
+        # duration always, and dram bytes (Range Profiler, one-shot per
+        # num_tokens) when admin + system libcupti preload + --enforce-eager.
+        # Best-effort; never fatal.
         if self.observability_config.enable_cupti:
             from vllm.v1.worker.cupti_profiler import start_cupti_profiling
 
@@ -755,6 +758,8 @@ class Worker(WorkerBase):
                 db_dir=self.observability_config.cupti_db_dir,
                 rank=self.rank,
                 model_name=self.model_config.model,
+                model_runner=self.model_runner,
+                enforce_eager=self.model_config.enforce_eager,
             )
 
         return CompilationTimes(
