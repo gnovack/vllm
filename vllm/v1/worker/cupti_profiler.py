@@ -364,27 +364,48 @@ def _dram_preflight(enforce_eager) -> bool:
 
 def _tensor_op_candidates(cc_major: int):
     """Per-GPU-arch tensor-op (math op count) metrics, as (stored_name, cupti).
-    Blackwell (sm_100+) uses the UTC* tensor-core path; Hopper (sm_90) and
-    earlier use hmma/imma/qmma. Invalid names for a given chip are filtered out
-    at startup, so over-listing is harmless."""
-    if cc_major >= 10:  # Blackwell
-        base = "sm__ops_path_tensor_op_utc"
-        fp8 = base + "qmma_src_fp4_fp6_fp8_dst_fp32_sparsity_off.sum"
-    else:               # Hopper / Ampere / Ada
-        base = "sm__ops_path_tensor_op_"
-        fp8 = base + "qmma_src_e4m3_dst_fp32_sparsity_off.sum"
+    Blackwell (sm_100+) uses the UTC* tensor-core path; Hopper (sm_90) uses the
+    warpgroup *gmma* counters (hgmma/igmma) with hmma/imma as fallbacks for
+    Ampere/Ada. Invalid names for a given chip are filtered out at startup, so
+    over-listing is harmless."""
     # Order = priority: a single HW pass only fits dram + a couple of distinct
     # tensor-core pipes, and the greedy selector (_select_dram_metrics) keeps the
     # ones listed first. For vLLM inference the dominant GEMM dtypes are bf16 and
     # fp8 (quantized), so they come before fp16/tf32, which are rarely the main
-    # path in serving. fp16/tf32 share bf16's hmma counter and ride along for
-    # free when they fit.
+    # path in serving.
+    if cc_major >= 10:  # Blackwell: UTC* tensor-core path
+        base = "sm__ops_path_tensor_op_utc"
+        return [
+            ("tensor_ops_bf16", base + "hmma_src_bf16_dst_fp32_sparsity_off.sum"),
+            ("tensor_ops_fp8",
+             base + "qmma_src_fp4_fp6_fp8_dst_fp32_sparsity_off.sum"),
+            ("tensor_ops_int8", base + "imma_src_int8_sparsity_off.sum"),
+            ("tensor_ops_fp16", base + "hmma_src_fp16_dst_fp32_sparsity_off.sum"),
+            ("tensor_ops_tf32", base + "hmma_src_tf32_dst_fp32_sparsity_off.sum"),
+        ]
+    # Hopper (sm_90) / Ampere / Ada. Hopper's dominant GEMM path is the
+    # warpgroup MMA (WGMMA), which increments the *gmma* counters
+    # (hgmma/igmma) rather than the per-warp hmma/imma counters; cuBLAS and
+    # cutlass Hopper kernels use WGMMA, so list the warpgroup variants FIRST
+    # (the greedy single-pass selector keeps the earliest that fit). FP8 on
+    # Hopper is counted by sm__ops_path_tensor_src_fp8 -- there is no
+    # qmma_src_e4m3 op-path metric on gh100 (verified via
+    # `ncu --query-metrics --chip gh100`). The per-warp hmma/imma variants are
+    # kept as lower-priority, distinctly-named fallback columns: Ampere/Ada use
+    # them, and on Hopper they catch any non-WGMMA kernels. Invalid names for a
+    # given chip self-filter at startup, so over-listing is safe.
+    op = "sm__ops_path_tensor_op_"
     return [
-        ("tensor_ops_bf16", base + "hmma_src_bf16_dst_fp32_sparsity_off.sum"),
-        ("tensor_ops_fp8", fp8),
-        ("tensor_ops_int8", base + "imma_src_int8_sparsity_off.sum"),
-        ("tensor_ops_fp16", base + "hmma_src_fp16_dst_fp32_sparsity_off.sum"),
-        ("tensor_ops_tf32", base + "hmma_src_tf32_dst_fp32_sparsity_off.sum"),
+        ("tensor_ops_bf16", op + "hgmma_src_bf16_dst_fp32_sparsity_off.sum"),
+        ("tensor_ops_fp8", "sm__ops_path_tensor_src_fp8_sparsity_off.sum"),
+        ("tensor_ops_int8", op + "igmma_src_int8_sparsity_off.sum"),
+        ("tensor_ops_fp16", op + "hgmma_src_fp16_sparsity_off.sum"),
+        ("tensor_ops_tf32", op + "hgmma_src_tf32_dst_fp32_sparsity_off.sum"),
+        # Per-warp MMA fallbacks (Ampere/Ada; non-WGMMA Hopper kernels):
+        ("tensor_ops_bf16_mma", op + "hmma_src_bf16_dst_fp32_sparsity_off.sum"),
+        ("tensor_ops_int8_mma", op + "imma_src_int8_sparsity_off.sum"),
+        ("tensor_ops_fp16_mma", op + "hmma_src_fp16_dst_fp32_sparsity_off.sum"),
+        ("tensor_ops_tf32_mma", op + "hmma_src_tf32_dst_fp32_sparsity_off.sum"),
     ]
 
 
@@ -761,7 +782,13 @@ def start_cupti_profiling(
             cupti.activity_register_callbacks(_buffer_requested, _buffer_completed)
             cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
 
-            drv = cupti.Driver_api_trace_cbid
+            # cupti-python renamed this enum across releases: 13.3 exposes
+            # ``Driver_api_trace_cbid`` while 12.x / 13.0 expose the lowercase
+            # ``driver_api_trace_cbid``. Accept whichever this install provides
+            # (the matching version is dictated by the torch CUDA build, since
+            # cupti-python must match the already-loaded libcupti soname).
+            drv = getattr(cupti, "Driver_api_trace_cbid", None) or \
+                cupti.driver_api_trace_cbid
             _driver_launch_cbids = {
                 int(drv.cuLaunchKernel),
                 int(drv.cuLaunchKernel_ptsz),
