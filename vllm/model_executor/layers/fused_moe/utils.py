@@ -3,7 +3,9 @@
 from math import prod
 
 import torch
+import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
@@ -461,11 +463,11 @@ def _swiglu_limit_kernel(
     tl.store(output_ptr + offsets, result.to(output_ptr.dtype.element_ty), mask=mask)
 
 
-def swiglu_limit_func(
+def _swiglu_limit_custom(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
     topk_ids: torch.Tensor,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float,
 ) -> None:
     num_tokens, input_width = input.shape
     hidden_size = input_width // 2
@@ -487,3 +489,34 @@ def swiglu_limit_func(
         HAS_LIMIT=swiglu_limit > 0,
         BLOCK_SIZE=BLOCK_SIZE,
     )
+
+
+@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+def _swiglu_limit_torch(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    swiglu_limit: float = 0.0,
+) -> None:
+    d = input.shape[1] // 2
+    gate = input[:, :d]
+    up = input[:, d:]
+
+    if swiglu_limit > 0:
+        gate = torch.clamp(gate, max=swiglu_limit)
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+
+    output.copy_(F.silu(gate) * up)
+
+
+def swiglu_limit_func(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    swiglu_limit: float = 0.0,
+    topk_ids: torch.Tensor | None = None,
+) -> None:
+    # The custom Triton kernel skips unrouted token slots (topk_ids == -1),
+    # so it requires topk_ids. Fall back to the torch implementation otherwise.
+    if envs.VLLM_USE_CUSTOM_SWIGLU and topk_ids is not None:
+        _swiglu_limit_custom(output, input, topk_ids, swiglu_limit)
+    else:
+        _swiglu_limit_torch(output, input, swiglu_limit)

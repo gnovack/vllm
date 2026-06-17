@@ -134,7 +134,6 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
-    print(f"block_size_m: {block_size_m} | num_tokens_post_padded: {num_tokens_post_padded} | expert_ids: {expert_ids.shape} | gate_up_input {gate_up_input.shape}")
     intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         gate_up_input,
         intermediate_cache1,
@@ -164,13 +163,11 @@ def _fused_marlin_moe(
         is_zp_float=False,
     )
     if clamp_limit is not None and activation == MoEActivation.SILU:
-        print(f"activation input: {intermediate_cache1.view(-1, w13_num_shards * N).shape} | {intermediate_cache1.view(-1, w13_num_shards * N)[:, :8]}")
-        print(f"activation output: {intermediate_cache2.shape}")
         swiglu_limit_func(
             intermediate_cache2,
             intermediate_cache1.view(-1, w13_num_shards * N),
-            topk_ids,
             clamp_limit,
+            topk_ids=topk_ids,
         )
     else:
         activation_func(
