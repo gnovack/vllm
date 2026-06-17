@@ -3,7 +3,6 @@
 from math import prod
 
 import torch
-import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -424,18 +423,67 @@ def trtllm_moe_pack_topk_ids_weights(
     return output.reshape(original_shape)
 
 
-@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+@triton.jit
+def _swiglu_limit_kernel(
+    input_ptr,  # [num_tokens, 2 * hidden_size]; first half gate, second half up
+    output_ptr,  # [num_tokens, hidden_size]
+    topk_ids_ptr,
+    hidden_size,  # output width (half of the input width)
+    input_row_stride,  # row stride of input (== 2 * hidden_size for contiguous)
+    num_elements,  # num_tokens * hidden_size
+    swiglu_limit,
+    HAS_LIMIT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_elements
+
+    col = offsets % hidden_size
+    row = offsets // hidden_size
+    gate_offsets = row * input_row_stride + col
+    up_offsets = gate_offsets + hidden_size
+
+    token_idx = (tl.program_id(0) * BLOCK_SIZE) // hidden_size
+    expert_id = tl.load(topk_ids_ptr + token_idx)
+    if expert_id == -1: 
+        return
+
+    gate = tl.load(input_ptr + gate_offsets, mask=mask).to(tl.float32)
+    up = tl.load(input_ptr + up_offsets, mask=mask).to(tl.float32)
+
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, swiglu_limit)
+        up = tl.maximum(up, -swiglu_limit)
+        up = tl.minimum(up, swiglu_limit)
+
+    silu_gate = gate / (1.0 + tl.exp(-gate))
+    result = silu_gate * up
+    tl.store(output_ptr + offsets, result.to(output_ptr.dtype.element_ty), mask=mask)
+
+
 def swiglu_limit_func(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
+    topk_ids: torch.Tensor,
     swiglu_limit: float = 0.0,
 ) -> None:
-    d = input.shape[1] // 2
-    gate = input[:, :d]
-    up = input[:, d:]
+    num_tokens, input_width = input.shape
+    hidden_size = input_width // 2
+    num_elements = num_tokens * hidden_size
 
-    if swiglu_limit > 0:
-        gate = torch.clamp(gate, max=swiglu_limit)
-        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
-
-    output.copy_(F.silu(gate) * up)
+    BLOCK_SIZE = 1024
+    assert hidden_size >= BLOCK_SIZE and hidden_size % BLOCK_SIZE == 0, (
+        "swiglu skip-routing assumes each block maps to a single token row"
+    )
+    grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
+    _swiglu_limit_kernel[grid](
+        input,
+        output,
+        topk_ids,
+        hidden_size,
+        input_width,
+        num_elements,
+        swiglu_limit,
+        HAS_LIMIT=swiglu_limit > 0,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
