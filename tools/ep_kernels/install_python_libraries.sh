@@ -14,6 +14,8 @@ NVSHMEM_VER=${NVSHMEM_VER:-"3.3.24"}  # Default supports both CUDA 12 and 13
 WORKSPACE=${WORKSPACE:-$(pwd)/ep_kernels_workspace}
 MODE=${MODE:-install}
 CUDA_VERSION_MAJOR=$("${CUDA_HOME}"/bin/nvcc --version | grep -E -o "release [0-9]+" | cut -d ' ' -f 2)
+NCCL_MIN_VER=${NCCL_MIN_VER:-"2.30.4"} # DeepEP v2 requires NCCL 2.30.4 or higher
+NCCL_PIP_PACKAGE="nvidia-nccl-cu${CUDA_VERSION_MAJOR}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -78,8 +80,20 @@ pushd "$WORKSPACE"
 # install dependencies if not installed
 if [ -z "$VIRTUAL_ENV" ]; then
   uv pip install --system cmake torch ninja
+  uv pip install --system "${NCCL_PIP_PACKAGE}>=${NCCL_MIN_VER}"
+  SITE_PACKAGES=$(uv pip show --system "$NCCL_PIP_PACKAGE" \
+      | sed -n 's/^Location: //p')
 else
   uv pip install cmake torch ninja
+  uv pip install "${NCCL_PIP_PACKAGE}>=${NCCL_MIN_VER}"
+  SITE_PACKAGES=$(uv pip show "$NCCL_PIP_PACKAGE" \
+      | sed -n 's/^Location: //p')
+fi
+
+NCCL_LIB="$SITE_PACKAGES/nvidia/nccl/lib"
+if [ ! -d "$NCCL_LIB" ]; then
+    echo "Error: NCCL library not found at $NCCL_LIB." >&2
+    exit 1
 fi
 
 # fetch nvshmem
@@ -186,7 +200,7 @@ do_build \
     "DeepEP" \
     "setup.py" \
     "$DEEPEP_COMMIT_HASH" \
-    "export NVSHMEM_DIR=$WORKSPACE/nvshmem; "
+    "export NVSHMEM_DIR=$WORKSPACE/nvshmem LDFLAGS=\"-L$NCCL_LIB ${LDFLAGS:-}\"; "
 
 if [ "$MODE" = "wheel" ]; then
     echo "All wheels written to $WHEEL_DIR"

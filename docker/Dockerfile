@@ -488,7 +488,7 @@ WORKDIR /workspace
 # Build DeepEP wheels
 COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.sh
 # Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
-ARG DEEPEP_COMMIT_HASH=73b6ea4
+ARG DEEPEP_COMMIT_HASH=d4f41e4e93
 ARG NVSHMEM_VER
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
@@ -696,6 +696,7 @@ RUN apt-get update -y \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
         libibverbs-dev \
+        infiniband-diags \
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
     && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
@@ -905,7 +906,7 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system ep_kernels/dist/*.whl --verbose \
+    uv pip install --system ep_kernels/dist/*.whl "nvidia-nccl-cu$(echo $CUDA_VERSION | cut -d. -f1)>=2.30.4" --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
 # nvidia-cutlass-dsl[cu13] installs -libs-base and -libs-cu13 wheels that
@@ -1042,6 +1043,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
                 libcublas-dev-${CUDA_VERSION_DASH} \
                 libcusolver-dev-${CUDA_VERSION_DASH}"; \
     if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
+        # Capture existing NCCL version to reinstall after torch downgrades it
+        NCCL_VER=$(uv pip show nvidia-nccl-cu${CUDA_MAJOR} | awk '/^Version:/ {print $2}'); \
         uv pip install --system -r /tmp/kv_connectors.txt --no-build || ( \
             # if the above fails, install from source
             apt-get update -y && \
@@ -1052,7 +1055,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             rm -rf /var/lib/apt/lists/* \
         ); \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
-        uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
+        uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR} nvidia-nccl-cu${CUDA_MAJOR}==${NCCL_VER}; \
     fi
 
 # Optional override: install mooncake-transfer-engine from a URL instead of the
