@@ -155,6 +155,14 @@ class ForwardContext:
     # the producer does not set it.
     is_padding: torch.Tensor | None = None
 
+    # Set by a topk routing kernel (e.g. topk_softmax/topk_sigmoid) once it
+    # has already written the -1 skip sentinel into topk_ids for is_padding
+    # rows in-kernel, so FusedMoEModularKernel._prepare can skip re-applying
+    # the same masking via torch.where. Reset per layer by callers that
+    # append additional expert ids after the kernel call (e.g. fused shared
+    # experts) since those ids are not covered by the in-kernel masking.
+    topk_padding_masked_in_kernel: bool = False
+
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
 

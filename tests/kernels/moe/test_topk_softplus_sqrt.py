@@ -73,6 +73,127 @@ def test_sqrtsoftplus_bias_uses_deepseek_v4_routing_method():
     not current_platform.is_cuda_alike(),
     reason="This test is skipped on non-CUDA platform.",
 )
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half, torch.float32])
+def test_fused_topk_softplus_sqrt_nan_inf_clamp(
+    bad_value: float,
+    dtype: torch.dtype,
+):
+    torch.manual_seed(0)
+    num_tokens = 4
+    hidden_size = 1024
+    num_experts = 256
+    topk = 6
+    hidden_states = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+    gating_output[1:, :] = bad_value
+
+    topk_weights, topk_ids = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=None,
+        topk=topk,
+        renormalize=True,
+    )
+
+    topk_weights_ref, topk_ids_ref = _torch_topk_softplus_sqrt(
+        gating_output=gating_output[:1],
+        topk=topk,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+    )
+    torch.testing.assert_close(topk_ids[:1], topk_ids_ref, atol=0, rtol=0)
+    torch.testing.assert_close(topk_weights[:1], topk_weights_ref, atol=2e-2, rtol=1e-2)
+
+    for row in range(1, num_tokens):
+        row_ids = topk_ids[row]
+        valid_ids = row_ids[(row_ids >= 0) & (row_ids < num_experts)]
+        assert valid_ids.unique().numel() == valid_ids.numel(), (
+            f"Row {row} has duplicate valid expert IDs {row_ids.tolist()} "
+            f"(bad_value={bad_value})"
+        )
+        invalid_mask = row_ids == -1
+        assert torch.isfinite(topk_weights[row]).all(), (
+            f"Row {row} has non-finite weights {topk_weights[row].tolist()} "
+            f"(bad_value={bad_value})"
+        )
+        assert (topk_weights[row][invalid_mask] == 0).all(), (
+            f"Row {row} has non-zero sentinel weights "
+            f"{topk_weights[row].tolist()} (bad_value={bad_value})"
+        )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="This test is skipped on non-CUDA platform.",
+)
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half, torch.float32])
+def test_fused_topk_softplus_sqrt_hash_nan_inf_clamp(
+    bad_value: float,
+    dtype: torch.dtype,
+):
+    torch.manual_seed(0)
+    num_tokens = 4
+    hidden_size = 1024
+    num_experts = 256
+    topk = 6
+    vocab_size = 32
+    hidden_states = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+    gating_output[1:, :] = bad_value
+    hash_indices_table = torch.stack(
+        [
+            (torch.arange(topk, dtype=torch.int64) + token_id) % num_experts
+            for token_id in range(vocab_size)
+        ]
+    ).to(device="cuda")
+    input_ids = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+
+    topk_weights, topk_ids = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=None,
+        topk=topk,
+        renormalize=True,
+        indices_type=torch.int64,
+        input_tokens=input_ids,
+        hash_indices_table=hash_indices_table,
+    )
+
+    topk_weights_ref, topk_ids_ref = _torch_topk_softplus_sqrt(
+        gating_output=gating_output[:1],
+        topk=topk,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        input_ids=input_ids[:1],
+        hash_indices_table=hash_indices_table,
+    )
+    torch.testing.assert_close(
+        topk_ids[:1], topk_ids_ref.to(topk_ids.dtype), atol=0, rtol=0
+    )
+    torch.testing.assert_close(topk_weights[:1], topk_weights_ref, atol=2e-2, rtol=1e-2)
+
+    for row in range(1, num_tokens):
+        assert torch.equal(topk_ids[row], torch.full_like(topk_ids[row], -1)), (
+            f"Row {row} should contain only sentinel IDs (bad_value={bad_value})"
+        )
+        assert torch.isfinite(topk_weights[row]).all(), (
+            f"Row {row} has non-finite weights {topk_weights[row].tolist()} "
+            f"(bad_value={bad_value})"
+        )
+        assert (topk_weights[row] == 0).all(), (
+            f"Row {row} has non-zero weights {topk_weights[row].tolist()} "
+            f"(bad_value={bad_value})"
+        )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="This test is skipped on non-CUDA platform.",
+)
 @pytest.mark.parametrize("num_tokens", [1, 33, 128])
 @pytest.mark.parametrize("hidden_size", [1024, 2048])
 @pytest.mark.parametrize("num_experts", [128, 256, 384, 512])

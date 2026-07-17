@@ -1187,6 +1187,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
+        # --- wasted-token accounting (per DP rank) ---------------------------
+        # Every step that actually runs a forward is counted here. "padded" is
+        # what this rank executed (CUDA-graph bucket + DP-pad-to-max); "real" is
+        # the tokens the scheduler actually gave it. Waste = padded - real, split
+        # into (a) dummy runs (real==0 forwards done only to stay in the DP wave)
+        # and (b) padding on real steps. Each engine core is one DP rank, so this
+        # is naturally per-rank. Log interval via VLLM_WASTED_TOKEN_LOG_INTERVAL
+        # (steps; 0 disables). Cumulative from server start; diff two lines to
+        # exclude warmup.
+        if not hasattr(self, "_wt_log_interval"):
+            import os
+
+            self._wt_log_interval = int(
+                os.getenv("VLLM_WASTED_TOKEN_LOG_INTERVAL", "500")
+            )
+            self._wt_steps = self._wt_padded = self._wt_real = 0
+            self._wt_dummy_steps = self._wt_dummy_padded = 0
+            self._wt_last = (0, 0, 0)  # (steps, padded, real) at last log
+        _padded = batch_desc.num_tokens
+        self._wt_steps += 1
+        self._wt_padded += _padded
+        if dummy_run:
+            self._wt_dummy_steps += 1
+            self._wt_dummy_padded += _padded
+        else:
+            self._wt_real += num_toks
+        if self._wt_log_interval and self._wt_steps % self._wt_log_interval == 0:
+            waste = self._wt_padded - self._wt_real
+            d_steps = self._wt_steps - self._wt_last[0]
+            d_pad = self._wt_padded - self._wt_last[1]
+            d_real = self._wt_real - self._wt_last[2]
+            self._wt_last = (self._wt_steps, self._wt_padded, self._wt_real)
+            logger.info(
+                "[wasted-tokens DP%d] cumulative: steps=%d real=%d padded=%d "
+                "waste=%d (%.1f%%) dummy_steps=%d dummy_padded=%d | "
+                "window(%d steps): waste=%.1f%% | last_dp_vec=%s",
+                self.dp_rank,
+                self._wt_steps,
+                self._wt_real,
+                self._wt_padded,
+                waste,
+                100.0 * waste / max(self._wt_padded, 1),
+                self._wt_dummy_steps,
+                self._wt_dummy_padded,
+                d_steps,
+                100.0 * (d_pad - d_real) / max(d_pad, 1),
+                num_tokens_across_dp.tolist()
+                if num_tokens_across_dp is not None
+                else None,
+            )
+            # MoE per-rank EP load: read the GPU accumulator populated inside
+            # the (graphed) MoE forward. Sync here is safe -- we're between
+            # steps, not inside capture. Cumulative token->expert assignments
+            # this rank's local experts computed (excludes padding / -1).
+            from vllm.model_executor.layers.fused_moe.modular_kernel import (
+                moe_token_stats_buf,
+            )
+
+            _mbuf = moe_token_stats_buf()
+            if _mbuf is not None:
+                _valid, _local = _mbuf.tolist()
+                logger.info(
+                    "[moe-token-stats DP%d] valid_assign=%d local_assign=%d "
+                    "local_frac=%.4f",
+                    self.dp_rank,
+                    _valid,
+                    _local,
+                    _local / max(_valid, 1),
+                )
+        # ---------------------------------------------------------------------
+
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.

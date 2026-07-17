@@ -9,11 +9,22 @@ import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+
+
+def _get_topk_is_padding(num_tokens: int) -> torch.Tensor | None:
+    if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
+        return None
+    is_padding = get_forward_context().is_padding
+    if is_padding is None:
+        return None
+    # TODO: Properly support DBO (padding lives at the batch tail).
+    return is_padding[:num_tokens]
 
 
 def vllm_topk_softmax(
@@ -24,6 +35,7 @@ def vllm_topk_softmax(
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    is_padding = _get_topk_is_padding(gating_output.shape[0])
     ops.topk_softmax(
         topk_weights,
         topk_indices,
@@ -31,7 +43,10 @@ def vllm_topk_softmax(
         gating_output,
         renormalize,
         e_score_correction_bias,
+        is_padding=is_padding,
     )
+    if is_padding is not None:
+        get_forward_context().topk_padding_masked_in_kernel = True
 
     return topk_weights, topk_indices
 
@@ -45,6 +60,7 @@ def vllm_topk_sigmoid(
     e_score_correction_bias: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, ...]:
+    is_padding = _get_topk_is_padding(gating_output.shape[0])
     ops.topk_sigmoid(
         topk_weights,
         topk_indices,
@@ -53,7 +69,10 @@ def vllm_topk_sigmoid(
         renormalize,
         e_score_correction_bias,
         routed_scaling_factor,
+        is_padding=is_padding,
     )
+    if is_padding is not None:
+        get_forward_context().topk_padding_masked_in_kernel = True
 
     return topk_weights, topk_indices
 
@@ -130,6 +149,7 @@ def vllm_topk_softplus_sqrt(
             routed_scaling_factor,
         )
 
+    is_padding = _get_topk_is_padding(gating_output.shape[0])
     ops.topk_hash_softplus_sqrt(
         topk_weights,
         topk_indices,
@@ -140,7 +160,10 @@ def vllm_topk_softplus_sqrt(
         e_score_correction_bias,
         input_tokens,
         hash_indices_table,
+        is_padding=is_padding,
     )
+    if is_padding is not None:
+        get_forward_context().topk_padding_masked_in_kernel = True
 
     return topk_weights, topk_indices
 
@@ -408,5 +431,10 @@ class FusedTopKBiasRouter(BaseRouter):
             )
             topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
             topk_weights = torch.cat([topk_weights, shared_w], dim=-1)
+            # The appended shared-expert ids are not covered by the in-kernel
+            # is_padding masking above, so the modular kernel's own
+            # torch.where fallback must still run to drop padding rows.
+            if is_forward_context_available():
+                get_forward_context().topk_padding_masked_in_kernel = False
 
         return topk_weights, topk_ids

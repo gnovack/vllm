@@ -5,13 +5,25 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+
+
+def _get_topk_is_padding(num_tokens: int) -> torch.Tensor | None:
+    if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
+        return None
+    is_padding = get_forward_context().is_padding
+    if is_padding is None:
+        return None
+    # TODO: Properly support DBO (padding lives at the batch tail).
+    return is_padding[:num_tokens]
 
 
 def vllm_topk_softmax(
@@ -21,13 +33,17 @@ def vllm_topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
 ) -> tuple[torch.Tensor, ...]:
+    is_padding = _get_topk_is_padding(gating_output.shape[0])
     ops.topk_softmax(
         topk_weights,
         topk_indices,
         token_expert_indices,
         gating_output,
         renormalize,
+        is_padding=is_padding,
     )
+    if is_padding is not None:
+        get_forward_context().topk_padding_masked_in_kernel = True
 
     return topk_weights, topk_indices
 
@@ -39,13 +55,17 @@ def vllm_topk_sigmoid(
     gating_output: torch.Tensor,
     renormalize: bool = False,
 ) -> tuple[torch.Tensor, ...]:
+    is_padding = _get_topk_is_padding(gating_output.shape[0])
     ops.topk_sigmoid(
         topk_weights,
         topk_indices,
         token_expert_indices,
         gating_output,
         renormalize,
+        is_padding=is_padding,
     )
+    if is_padding is not None:
+        get_forward_context().topk_padding_masked_in_kernel = True
 
     return topk_weights, topk_indices
 

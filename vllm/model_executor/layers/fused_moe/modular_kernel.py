@@ -43,6 +43,30 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+# --- per-rank EP-load accounting (VLLM_MOE_TOKEN_STATS=1) --------------------
+# Counts topk_ids routing entries that land on THIS rank's local experts, to
+# read how expert load is actually distributed across EP ranks. Involves
+# GPU->CPU syncs per MoE layer, so it is OFF by default (measurement-only;
+# do not enable for perf runs). Process-global: each engine-core process is one
+# rank and accumulates its own numbers; the log prefix (Worker_DP*_EP*)
+# identifies the rank.
+import os as _os
+
+# GPU-resident accumulator so counting is CUDA-graph-safe: we must NOT sync to
+# host inside the (captured) forward, and during graph *replay* Python here does
+# not run -- so we accumulate into a persistent GPU buffer whose in-graph
+# increments replay every step, and read it out (synced) from the model runner
+# between steps. buf = int64[2] = [valid_assign, local_assign] for THIS rank.
+_MOE_TOK_STATS = {
+    "on": _os.getenv("VLLM_MOE_TOKEN_STATS", "0") == "1",
+    "buf": None,
+}
+
+
+def moe_token_stats_buf():
+    """Return this process/rank's [valid_assign, local_assign] accumulator."""
+    return _MOE_TOK_STATS["buf"]
+
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
 # The goal is to be able to utilize different communication mechanisms with
@@ -1144,7 +1168,13 @@ class FusedMoEKernelModularImpl:
         # MoE backends support yet.
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-            is_padding = get_forward_context().is_padding
+            ctx = get_forward_context()
+            is_padding = ctx.is_padding
+            if is_padding is not None and ctx.topk_padding_masked_in_kernel:
+                # The router's topk kernel (topk_softmax/topk_sigmoid) already
+                # wrote the -1 sentinel for padding rows in-kernel, so redoing
+                # it here would just be a redundant full-tensor kernel launch.
+                is_padding = None
         if is_padding is not None:
             n = topk_ids.shape[0]
             # TODO: Properly support DBO (padding lives at the batch tail).
@@ -1239,6 +1269,28 @@ class FusedMoEKernelModularImpl:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
         )
+
+        if _MOE_TOK_STATS["on"]:
+            # Count routing entries assigned to THIS rank's local experts.
+            # topk_ids here is the post-dispatch (gathered, for allgather EP)
+            # tensor of GLOBAL expert ids; expert_map[g] == -1 means g is not
+            # local. Padding rows carry topk_id == -1 and are excluded.
+            # CUDA-graph-safe: accumulate on-GPU, never sync to host here.
+            buf = _MOE_TOK_STATS["buf"]
+            if buf is None and not torch.cuda.is_current_stream_capturing():
+                # Allocate before capture (vLLM runs eager warmups first) so the
+                # in-graph increments below have a stable buffer to hit.
+                buf = torch.zeros(2, dtype=torch.int64, device=topk_ids.device)
+                _MOE_TOK_STATS["buf"] = buf
+            if buf is not None:
+                valid = topk_ids != -1
+                n_total = valid.sum()
+                if expert_map is not None:
+                    is_local = expert_map[topk_ids.clamp_min(0).long()] != -1
+                    n_local = (valid & is_local).sum()
+                else:
+                    n_local = n_total  # no EP: every expert is local
+                buf += torch.stack([n_total, n_local])
 
         # This happens when none of the tokens from the all2all reach this
         # EP rank. Also, note that this is only relevant for CUDAGraph

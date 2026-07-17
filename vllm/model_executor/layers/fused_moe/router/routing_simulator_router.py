@@ -132,13 +132,10 @@ class DistributionBasedRouting(RoutingStrategy):
 
         if self.distribution == "uniform":
             # Uniform random sampling
-            return torch.randint(
-                low=0,
-                high=num_experts,
-                size=(num_tokens, top_k),
-                dtype=indices_type,
-                device=device,
-            )
+            # No-replacement top_k so each token's experts are unique (deepep_v2 dispatch asserts on dup)
+            return torch.topk(
+                torch.rand(num_tokens, num_experts, device=device), top_k, dim=1
+            ).indices.to(indices_type)
 
         elif self.distribution == "normal":
             # For normal distribution, sample continuous values and map to
